@@ -119,7 +119,8 @@ def aero_urdfpath(use_hand=True):
         If False, return the hand-less model whose arms end at the
         ``*_eef_*`` frames (``aero_nohand.urdf``).
     """
-    name = 'aero.urdf' if use_hand else 'aero_nohand.urdf'
+    # name = 'aero.urdf' if use_hand else 'aero_nohand.urdf'
+    name = 'aero_with_feetech_hand.urdf' if use_hand else 'aero_nohand.urdf'
     path = osp.join(get_cache_dir(), 'aero_description',
                     'typeJSK', 'urdf', name)
     if osp.exists(path):
