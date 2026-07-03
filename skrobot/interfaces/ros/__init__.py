@@ -7,5 +7,7 @@ PandaROSRobotInterface = LazyImportClass(
     ".panda", "PandaROSRobotInterface", "skrobot.interfaces.ros")
 PR2ROSRobotInterface = LazyImportClass(
     ".pr2", "PR2ROSRobotInterface", "skrobot.interfaces.ros")
+AeroROSRobotInterface = LazyImportClass(
+    ".aero", "AeroROSRobotInterface", "skrobot.interfaces.ros")
 
-__all__ = ["NextageROSRobotInterface", "PandaROSRobotInterface", "PR2ROSRobotInterface"]
+__all__ = ["NextageROSRobotInterface", "PandaROSRobotInterface", "PR2ROSRobotInterface", "AeroROSRobotInterface"]
