@@ -82,8 +82,14 @@ class Aero(RobotModel):
         self.knee_joint.joint_angle(np.deg2rad(-30.0))
         return self.angle_vector()
 
+    # l_hand_y_joint / r_hand_y_joint (hand_yaw_link's actuator) exist in the
+    # URDF but not on this unit's real hardware, so they must stay fixed and
+    # be excluded from any IK-solved joint_list.
+    _FIXED_JOINT_NAMES = ('r_hand_y_joint', 'l_hand_y_joint')
+
     def _limb(self, links, end_coords):
-        joint_list = [link.joint for link in links if link.joint is not None]
+        joint_list = [link.joint for link in links if link.joint is not None
+                     and link.joint.name not in self._FIXED_JOINT_NAMES]
         r = RobotModel(link_list=links, joint_list=joint_list)
         r.end_coords = end_coords
         return r
