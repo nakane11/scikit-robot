@@ -3432,14 +3432,38 @@ class ViserViewer(_InteractiveViewerMixin):
                 colors = mesh.colors[:, :3]
             else:
                 colors = np.zeros(3)
-            self._server.scene.add_point_cloud(
+            handle = self._server.scene.add_point_cloud(
                     link_id,
                     points=mesh.vertices,
                     colors=colors,
                     point_size=0.002,  # TODO(HiroIshida): configurable
                 )
         elif isinstance(link, LineString):
-            raise NotImplementedError("not implemented yet")
+            path = link.visual_mesh
+            vertices = np.asarray(path.vertices, dtype=np.float32)
+            entity_colors = np.asarray(path.colors)
+            segments = []
+            segment_colors = []
+            for i, entity in enumerate(path.entities):
+                indices = np.asarray(entity.points, dtype=int)
+                if len(entity_colors) > 0:
+                    color = entity_colors[
+                        min(i, len(entity_colors) - 1)][:3]
+                else:
+                    color = np.array([255, 255, 255])
+                # A Path3D entity is a polyline, so consecutive index pairs
+                # are the line segments to draw.
+                for start, end in zip(indices[:-1], indices[1:]):
+                    segments.append([vertices[start], vertices[end]])
+                    segment_colors.append([color, color])
+            if segments:
+                handle = self._server.scene.add_line_segments(
+                    link_id,
+                    points=np.asarray(segments, dtype=np.float32),
+                    colors=np.asarray(segment_colors, dtype=np.uint8),
+                    wxyz=matrix2quaternion(link.worldrot()),
+                    position=link.worldpos(),
+                )
         else:
             mesh = link.concatenated_visual_mesh
             if mesh is not None:
