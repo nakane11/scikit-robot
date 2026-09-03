@@ -341,6 +341,188 @@ def test_batch_base_weight_rejects_nonpositive():
         )
 
 
+def _planar_xyyaw(base_pose):
+    """(x, y, yaw) of a planar base pose."""
+    pos = base_pose.worldpos()
+    rot = base_pose.worldrot()
+    return pos[0], pos[1], float(np.arctan2(rot[1, 0], rot[0, 0]))
+
+
+def test_resolve_base_limits_normalization():
+    """_resolve_base_limits handles None, partial bounds, and validation."""
+    robot = _build_fetch()
+
+    lo, hi = robot._resolve_base_limits(None, 3, 'planar')
+    np.testing.assert_allclose(lo, [-np.inf] * 3)
+    np.testing.assert_allclose(hi, [np.inf] * 3)
+
+    lo, hi = robot._resolve_base_limits(
+        [(-0.2, 2.0), None, (None, 1.0)], 3, 'planar')
+    np.testing.assert_allclose(lo, [-0.2, -np.inf, -np.inf])
+    np.testing.assert_allclose(hi, [2.0, np.inf, 1.0])
+
+    # Wrong length mentions the expected count and the use_base value.
+    with pytest.raises(ValueError, match="base_limits"):
+        robot._resolve_base_limits([(-1.0, 1.0)], 3, 'planar')
+    # lower > upper is rejected.
+    with pytest.raises(ValueError, match="lower > upper"):
+        robot._resolve_base_limits(
+            [(1.0, -1.0), None, None], 3, 'planar')
+
+
+def test_batch_base_limits_confine_base():
+    """base_limits keeps the batch-IK base inside the requested box."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    targets = [
+        Coordinates(pos=ee + np.array([0.7 + 0.1 * i, 0.2, 0.0]))
+        for i in range(3)
+    ]
+    limits = [(-0.05, 0.3), (-0.05, 0.05), (-0.1, 0.1)]
+    _, base_poses, success, _ = robot.batch_inverse_kinematics(
+        target_coords=targets,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=200, thre=0.01,
+        backend='numpy', initial_angles='current',
+        use_base='planar', base_limits=limits,
+    )
+    eps = 1e-6
+    for bp in base_poses:
+        x, y, yaw = _planar_xyyaw(bp)
+        for value, (lo, hi) in zip((x, y, yaw), limits):
+            assert lo - eps <= value <= hi + eps, (
+                "base DoF {} left the box [{}, {}]".format(value, lo, hi))
+    # Sanity: the same targets without limits let the base travel further
+    # than the box allows, so the confinement above is not vacuous.
+    _, free_poses, _, _ = robot.batch_inverse_kinematics(
+        target_coords=targets,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=200, thre=0.01,
+        backend='numpy', initial_angles='current',
+        use_base='planar',
+    )
+    assert max(bp.worldpos()[0] for bp in free_poses) > 0.3
+
+
+def test_batch_base_limits_generous_box_still_solves():
+    """A box that contains the unbounded solution does not break solving."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    targets = [
+        Coordinates(pos=ee + np.array([0.7 + 0.1 * i, 0.2, 0.0]))
+        for i in range(3)
+    ]
+    limits = [(-0.2, 1.5), (-0.5, 0.5), (-0.5, 0.5)]
+    _, base_poses, success, _ = robot.batch_inverse_kinematics(
+        target_coords=targets,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=200, thre=0.01,
+        backend='numpy', initial_angles='current',
+        use_base='planar', base_limits=limits,
+    )
+    assert all(success), "unexpected failures: {}".format(success)
+    eps = 1e-6
+    for bp in base_poses:
+        for value, (lo, hi) in zip(_planar_xyyaw(bp), limits):
+            assert lo - eps <= value <= hi + eps
+
+
+def test_batch_base_limits_allow_travel_beyond_pi():
+    """Explicit base_limits lift the implicit +-pi clamp on translations."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    targets = [Coordinates(pos=ee + np.array([4.0, 0.0, 0.0]))]
+    _, base_poses, success, _ = robot.batch_inverse_kinematics(
+        target_coords=targets,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=300, thre=0.01,
+        backend='numpy', initial_angles='current',
+        use_base='planar',
+        base_limits=[(-1.0, 6.0), (-1.0, 1.0), (-np.pi, np.pi)],
+    )
+    assert success[0], "4 m target should be reachable with a 6 m x-range"
+    assert base_poses[0].worldpos()[0] > np.pi
+
+
+def test_batch_base_limits_ignored_without_use_base():
+    """base_limits without use_base warns and is otherwise inert."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    targets = [Coordinates(pos=ee + np.array([0.05, 0.0, 0.0]))]
+    with pytest.warns(RuntimeWarning, match="base_limits"):
+        robot.batch_inverse_kinematics(
+            target_coords=targets,
+            move_target=robot.rarm_end_coords,
+            link_list=robot.rarm.link_list,
+            rotation_mask=False,
+            stop=30, thre=0.02,
+            backend='numpy', initial_angles='current',
+            base_limits=[(-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)],
+        )
+
+
+def test_batch_base_limits_invalid_length_raises():
+    """A base_limits length mismatch is reported before solving."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    targets = [Coordinates(pos=ee + np.array([0.4, 0.0, 0.0]))]
+    with pytest.raises(ValueError, match="base_limits"):
+        robot.batch_inverse_kinematics(
+            target_coords=targets,
+            move_target=robot.rarm_end_coords,
+            link_list=robot.rarm.link_list,
+            rotation_mask=False,
+            stop=30, backend='numpy', initial_angles='current',
+            use_base='planar', base_limits=[(-1.0, 1.0), (-1.0, 1.0)],
+        )
+
+
+def test_nonbatch_base_limits_confine_base():
+    """Non-batch inverse_kinematics honours base_limits too."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    target = Coordinates(pos=ee + np.array([0.8, 0.2, 0.0]))
+    limits = [(-0.05, 0.3), (-0.05, 0.05), (-0.1, 0.1)]
+    robot.inverse_kinematics(
+        target,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=200, thre=0.01,
+        use_base='planar', base_limits=limits,
+    )
+    x, y, yaw = _planar_xyyaw(robot._find_fullbody_root_link())
+    eps = 1e-6
+    for value, (lo, hi) in zip((x, y, yaw), limits):
+        assert lo - eps <= value <= hi + eps, (
+            "base DoF {} left the box [{}, {}]".format(value, lo, hi))
+
+
+def test_nonbatch_base_limits_unbounded_by_default():
+    """Without base_limits the non-batch base is free to travel far."""
+    robot = _build_fetch()
+    ee = robot.rarm_end_coords.worldpos()
+    target = Coordinates(pos=ee + np.array([0.8, 0.2, 0.0]))
+    robot.inverse_kinematics(
+        target,
+        move_target=robot.rarm_end_coords,
+        link_list=robot.rarm.link_list,
+        rotation_mask=False,
+        stop=200, thre=0.01,
+        use_base='planar',
+    )
+    x, _, _ = _planar_xyyaw(robot._find_fullbody_root_link())
+    assert x > 0.3, "unbounded base should exceed the bounded box"
+
+
 def test_batch_joint_list_matches_link_list():
     """joint_list is an alternative spelling of link_list (same solutions)."""
     robot = _build_fetch()

@@ -1413,7 +1413,58 @@ class CascadedLink(CascadedCoords):
             'Cannot determine root_link for fullbody IK; '
             'set self.root_link or ensure one link has no parent_link.')
 
-    def _attach_virtual_base_joint(self, use_base, link_list):
+    @staticmethod
+    def _resolve_base_limits(base_limits, n_dof, use_base=None):
+        """Normalize a ``base_limits`` specification into limit arrays.
+
+        Parameters
+        ----------
+        base_limits : sequence or None
+            Per-DoF ``(lower, upper)`` pairs in DoF order --
+            ``[x, y, yaw]`` for ``'planar'`` and
+            ``[x, y, z, roll, pitch, yaw]`` for ``'6dof'``.
+            An entry of ``None`` (or a bound of ``None`` inside a pair)
+            means unbounded on that side. ``None`` for the whole argument
+            means every DoF is unbounded.
+        n_dof : int
+            Number of base DoFs (3 for ``'planar'``, 6 for ``'6dof'``).
+        use_base : str or None
+            Only used to make error messages actionable.
+
+        Returns
+        -------
+        (numpy.ndarray, numpy.ndarray)
+            ``(lower, upper)``, each of shape ``(n_dof,)`` and dtype float.
+        """
+        lower = np.full(n_dof, -np.inf, dtype=np.float64)
+        upper = np.full(n_dof, np.inf, dtype=np.float64)
+        if base_limits is None:
+            return lower, upper
+        limits = list(base_limits)
+        if len(limits) != n_dof:
+            raise ValueError(
+                'base_limits must have {} entries for use_base={!r} '
+                '(got {})'.format(n_dof, use_base, len(limits)))
+        for i, entry in enumerate(limits):
+            if entry is None:
+                continue
+            if np.isscalar(entry) or len(entry) != 2:
+                raise ValueError(
+                    'base_limits[{}] must be a (lower, upper) pair or None '
+                    'for use_base={!r}, got {!r}'.format(i, use_base, entry))
+            lo, hi = entry
+            lo = -np.inf if lo is None else float(lo)
+            hi = np.inf if hi is None else float(hi)
+            if lo > hi:
+                raise ValueError(
+                    'base_limits[{}] has lower > upper ({} > {}) for '
+                    'use_base={!r}'.format(i, lo, hi, use_base))
+            lower[i] = lo
+            upper[i] = hi
+        return lower, upper
+
+    def _attach_virtual_base_joint(self, use_base, link_list,
+                                   base_limits=None):
         """Inject a temporary virtual joint above root_link so IK can
         solve for the base pose as additional DoFs.
 
@@ -1423,12 +1474,16 @@ class CascadedLink(CascadedCoords):
         """
         if use_base == 'planar':
             joint_cls = PlanarJoint
+            n_dof = 3
         elif use_base == '6dof':
             joint_cls = FloatingJoint
+            n_dof = 6
         else:
             raise ValueError(
                 "use_base must be False, 'planar', or '6dof', got %r"
                 % (use_base,))
+        lower, upper = self._resolve_base_limits(
+            base_limits, n_dof, use_base)
         root_link = self._find_fullbody_root_link()
         virtual_link = Link(name='_fullbody_ik_virtual_world')
         state = {
@@ -1442,6 +1497,8 @@ class CascadedLink(CascadedCoords):
             parent_link=virtual_link,
             child_link=root_link,
             name='_fullbody_ik_base_joint',
+            min_angle=lower,
+            max_angle=upper,
         )
         # Detach root_link from its original parent's _child_links before
         # reparenting so the kinematic graph stays consistent (a link must
@@ -1495,7 +1552,8 @@ class CascadedLink(CascadedCoords):
             for key in state['rel_entries']:
                 self._relevance_predicate_table.pop(key, None)
 
-    def _attach_batch_virtual_base_chain(self, use_base, link_list):
+    def _attach_batch_virtual_base_chain(self, use_base, link_list,
+                                         base_limits=None):
         """Inject a chain of single-DoF virtual joints above ``root_link``.
 
         Unlike :meth:`_attach_virtual_base_joint`, which uses the multi-DoF
@@ -1538,6 +1596,9 @@ class CascadedLink(CascadedCoords):
                 "use_base must be False, 'planar', or '6dof', got %r"
                 % (use_base,))
 
+        lower, upper = self._resolve_base_limits(
+            base_limits, n_dof, use_base)
+
         root_link = self._find_fullbody_root_link()
         virtual_world = Link(name='_batch_ik_virtual_world')
 
@@ -1557,7 +1618,7 @@ class CascadedLink(CascadedCoords):
                     axis=axis,
                     parent_link=parent, child_link=child,
                     name='_batch_ik_virtual_{}{}_joint'.format(kind, axis),
-                    min_angle=-np.inf, max_angle=np.inf,
+                    min_angle=lower[i], max_angle=upper[i],
                     max_joint_velocity=np.inf,
                 )
             else:
@@ -1565,7 +1626,7 @@ class CascadedLink(CascadedCoords):
                     axis=axis,
                     parent_link=parent, child_link=child,
                     name='_batch_ik_virtual_{}{}_joint'.format(kind, axis),
-                    min_angle=-np.inf, max_angle=np.inf,
+                    min_angle=lower[i], max_angle=upper[i],
                     max_joint_velocity=np.inf,
                 )
             chain_joints.append(j)
@@ -1671,6 +1732,7 @@ class CascadedLink(CascadedCoords):
             rotation_tolerance=None,
             use_base=False,
             base_weight=None,
+            base_limits=None,
             joint_list=None,
             invariant_joint_list=None,
             **kwargs):
@@ -1744,6 +1806,19 @@ class CascadedLink(CascadedCoords):
             matching the base joint's DoF (3 for ``'planar'``, 6 for
             ``'6dof'``) allows per-axis weighting, e.g. ``[1.0, 1.0,
             0.1]`` for planar to discourage yaw changes.
+        base_limits : sequence or None
+            Joint limits for the virtual base DoFs, given as per-DoF
+            ``(lower, upper)`` pairs in DoF order: ``[x, y, yaw]`` for
+            ``use_base='planar'`` (metres, metres, radians) and
+            ``[x, y, z, roll, pitch, yaw]`` for ``use_base='6dof'``.
+            Bounds are expressed in the base's initial frame (the pose
+            the robot has when the call starts). An entry of ``None``, or
+            a ``None`` bound inside a pair, leaves that DoF (or that
+            side) unbounded; ``None`` for the whole argument -- the
+            default -- leaves every base DoF unbounded. Only meaningful
+            when ``use_base`` is set; a ``RuntimeWarning`` is issued
+            otherwise. Raises ``ValueError`` if the length does not match
+            the base DoF count or if a pair has ``lower > upper``.
         **kwargs
             Additional keyword arguments passed to inverse_kinematics_loop.
 
@@ -1795,7 +1870,8 @@ class CascadedLink(CascadedCoords):
         # Inject virtual joint for fullbody IK if requested.
         _base_state = None
         if use_base:
-            _base_state = self._attach_virtual_base_joint(use_base, link_list)
+            _base_state = self._attach_virtual_base_joint(
+                use_base, link_list, base_limits=base_limits)
             link_list = _base_state['link_list']
             base_joint_dof = _base_state['virtual_joint'].joint_dof
             if base_weight is None:
@@ -1810,6 +1886,10 @@ class CascadedLink(CascadedCoords):
         elif base_weight is not None:
             logger.warning(
                 'base_weight is ignored when use_base is False')
+        if not use_base and base_limits is not None:
+            warnings.warn(
+                'base_limits is ignored when use_base is False',
+                RuntimeWarning)
         try:
             additional_jacobi = additional_jacobi or []
             additional_vel = additional_vel or []
@@ -3560,6 +3640,7 @@ class RobotModel(CascadedLink):
             backend=None,
             use_base=False,
             base_weight=None,
+            base_limits=None,
             joint_list=None,
             invariant_joint_list=None,
             **kwargs):
@@ -3634,6 +3715,31 @@ class RobotModel(CascadedLink):
             Backend solver to use ('numpy' or 'jax'). Default is None,
             which auto-selects JAX if available, otherwise falls back to NumPy.
             JAX backend provides faster computation through JIT compilation.
+        base_limits : sequence or None
+            Joint limits for the virtual base DoFs, given as per-DoF
+            ``(lower, upper)`` pairs in DoF order: ``[x, y, yaw]`` for
+            ``use_base='planar'`` (metres, metres, radians) and
+            ``[x, y, z, roll, pitch, yaw]`` for ``use_base='6dof'``.
+            Bounds are expressed in the base's initial frame (the pose
+            the robot has when the call starts). An entry of ``None``, or
+            a ``None`` bound inside a pair, leaves that DoF (or that
+            side) unbounded. Only meaningful when ``use_base`` is set; a
+            ``RuntimeWarning`` is issued otherwise. Raises
+            ``ValueError`` if the length does not match the base DoF
+            count or if a pair has ``lower > upper``.
+
+            .. warning::
+
+               Unlike :meth:`inverse_kinematics`, leaving
+               ``base_limits`` as ``None`` here does **not** give the
+               base unbounded travel: the batch solver replaces
+               non-finite joint limits with ``-pi``/``+pi``, so the
+               translational base DoFs are implicitly clamped to
+               ``+-3.14`` m around the initial base position (and the
+               random initial angles used by ``attempts_per_pose`` are
+               drawn from that same range). Pass explicit
+               ``base_limits`` whenever the base needs to move further
+               than that, or whenever the two solvers must agree.
         **kwargs : dict
             Additional keyword arguments
 
@@ -3724,11 +3830,15 @@ class RobotModel(CascadedLink):
                 else:
                     link_list = self.link_lists(resolved_mt.parent)
             _base_state = self._attach_batch_virtual_base_chain(
-                use_base, link_list)
+                use_base, link_list, base_limits=base_limits)
             link_list = _base_state['link_list']
         elif base_weight is not None:
             warnings.warn(
                 'base_weight is ignored when use_base is False',
+                RuntimeWarning)
+        if not use_base and base_limits is not None:
+            warnings.warn(
+                'base_limits is ignored when use_base is False',
                 RuntimeWarning)
         try:
             result = self._batch_inverse_kinematics_impl(
