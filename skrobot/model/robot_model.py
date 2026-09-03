@@ -3643,6 +3643,16 @@ class RobotModel(CascadedLink):
             base_limits=None,
             joint_list=None,
             invariant_joint_list=None,
+            collision_link_list=None,
+            collision_obstacles=None,
+            self_collision=False,
+            collision_weight=10.0,
+            collision_margin=0.05,
+            self_collision_weight=None,
+            self_collision_margin=0.02,
+            n_spheres_per_link=3,
+            ignore_adjacent_self_collision=True,
+            collision_learning_rate=0.5,
             **kwargs):
         """Solve batch inverse kinematics for multiple target poses.
 
@@ -3740,6 +3750,40 @@ class RobotModel(CascadedLink):
                drawn from that same range). Pass explicit
                ``base_limits`` whenever the base needs to move further
                than that, or whenever the two solvers must agree.
+        collision_link_list : list[skrobot.model.Link] or None
+            Links to approximate with collision spheres for interference
+            avoidance. Required (non-empty) when ``collision_obstacles`` is
+            given or ``self_collision=True``. Switches the solver to a
+            gradient-descent method with the collision distance as a soft
+            penalty term, and requires ``backend='jax'``.
+        collision_obstacles : list or None
+            World-frame obstacles to avoid, as ``skrobot.model.primitives``
+            objects (``Sphere``, ``Box``, ``Cylinder``) or ``skrobot.collision``
+            geometry. SDF/mesh obstacles are not supported for batch IK.
+        self_collision : bool
+            If True, also penalize collisions between pairs of links in
+            ``collision_link_list``. Requires ``collision_link_list``.
+            Default is False.
+        collision_weight : float
+            Weight of the world-obstacle collision penalty. Default is 10.0.
+        collision_margin : float
+            Distance in meters from an obstacle at which the collision
+            penalty starts to activate. Default is 0.05.
+        self_collision_weight : float or None
+            Weight of the self-collision penalty. Defaults to
+            ``collision_weight`` when None.
+        self_collision_margin : float
+            Distance in meters between collision links at which the
+            self-collision penalty starts to activate. Default is 0.02.
+        n_spheres_per_link : int
+            Number of swept spheres approximating each collision link.
+            Default is 3.
+        ignore_adjacent_self_collision : bool
+            If True (default), skip self-collision pairs between adjacent
+            links in ``collision_link_list``.
+        collision_learning_rate : float
+            Gradient-descent step size, only used when collision avoidance
+            is active. Default is 0.5.
         **kwargs : dict
             Additional keyword arguments
 
@@ -3849,6 +3893,16 @@ class RobotModel(CascadedLink):
                 rotation_tolerance, backend=backend,
                 _base_state=_base_state,
                 base_weight=base_weight,
+                collision_link_list=collision_link_list,
+                collision_obstacles=collision_obstacles,
+                self_collision=self_collision,
+                collision_weight=collision_weight,
+                collision_margin=collision_margin,
+                self_collision_weight=self_collision_weight,
+                self_collision_margin=self_collision_margin,
+                n_spheres_per_link=n_spheres_per_link,
+                ignore_adjacent_self_collision=ignore_adjacent_self_collision,
+                collision_learning_rate=collision_learning_rate,
                 **kwargs)
         finally:
             if _base_state is not None:
@@ -3866,6 +3920,30 @@ class RobotModel(CascadedLink):
         # Fullbody IK state threaded from the public wrapper.
         _base_state = kwargs.pop('_base_state', None)
         _base_weight = kwargs.pop('base_weight', None)
+
+        collision_link_list = kwargs.pop('collision_link_list', None)
+        collision_obstacles = kwargs.pop('collision_obstacles', None)
+        self_collision = kwargs.pop('self_collision', False)
+        collision_weight = kwargs.pop('collision_weight', 10.0)
+        collision_margin = kwargs.pop('collision_margin', 0.05)
+        self_collision_weight = kwargs.pop('self_collision_weight', None)
+        self_collision_margin = kwargs.pop('self_collision_margin', 0.02)
+        n_spheres_per_link = kwargs.pop('n_spheres_per_link', 3)
+        ignore_adjacent_self_collision = kwargs.pop(
+            'ignore_adjacent_self_collision', True)
+        collision_learning_rate = kwargs.pop('collision_learning_rate', 0.5)
+        wants_collision_avoidance = bool(collision_obstacles) or self_collision
+        if wants_collision_avoidance and not collision_link_list:
+            raise ValueError(
+                "collision_link_list must be a non-empty list of links when "
+                "collision_obstacles is given or self_collision=True.")
+        if wants_collision_avoidance and _base_weight is not None:
+            raise ValueError(
+                "base_weight cannot be combined with collision avoidance "
+                "(collision_obstacles/self_collision) yet: base_weight "
+                "relies on the jacobian solver's per-joint weighting, which "
+                "the gradient-descent solver used for collision avoidance "
+                "does not support.")
 
         # Auto-select backend: prefer JAX if available, fallback to NumPy
         if backend is None:
@@ -3897,6 +3975,11 @@ class RobotModel(CascadedLink):
         move_target_is_list = isinstance(move_target, list)
         if link_list_is_nested and move_target_is_list \
                 and len(move_target) == len(link_list):
+            if wants_collision_avoidance:
+                raise NotImplementedError(
+                    "Collision avoidance (collision_obstacles/"
+                    "self_collision) is not yet supported for multi-EE "
+                    "batch_inverse_kinematics.")
             return self._batch_inverse_kinematics_multi_ee_impl(
                 target_coords, move_target, link_list,
                 rotation_mask, position_mask, rotation_mirror, stop, thre,
@@ -4002,8 +4085,10 @@ class RobotModel(CascadedLink):
         # Create or retrieve cached backend solver. When use_base attaches
         # a virtual chain, the fresh Link/Joint objects give unique id()s
         # every call, so caching would accumulate stale entries without
-        # ever hitting. Bypass the cache in that case.
-        if _base_state is None:
+        # ever hitting. Bypass the cache in that case, and also when
+        # collision avoidance is active, since the obstacle geometry is
+        # baked into the compiled solver at creation time.
+        if _base_state is None and not wants_collision_avoidance:
             cache_key = (
                 tuple(id(link) for link in single_link_list),
                 id(single_move_target),
@@ -4017,6 +4102,15 @@ class RobotModel(CascadedLink):
                         self, single_link_list, single_move_target,
                         backend_name=backend)
             solver = self._batch_ik_solver_cache[cache_key]
+        elif wants_collision_avoidance:
+            solver = create_batch_ik_solver(
+                self, single_link_list, single_move_target,
+                backend_name=backend, method='gradient_descent',
+                collision_link_list=collision_link_list,
+                collision_obstacles=collision_obstacles,
+                self_collision=self_collision,
+                n_spheres_per_link=n_spheres_per_link,
+                ignore_adjacent_self_collision=ignore_adjacent_self_collision)
         else:
             solver = create_batch_ik_solver(
                 self, single_link_list, single_move_target,
@@ -4034,7 +4128,15 @@ class RobotModel(CascadedLink):
             attempts_per_pose=attempts_per_pose,
             use_current_angles=use_current_angles,
         )
-        solver_kwargs['damping'] = 0.01
+        if wants_collision_avoidance:
+            solver_kwargs['collision_weight'] = collision_weight
+            solver_kwargs['collision_activation_distance'] = collision_margin
+            solver_kwargs['self_collision_weight'] = self_collision_weight
+            solver_kwargs['self_collision_activation_distance'] = \
+                self_collision_margin
+            solver_kwargs['learning_rate'] = collision_learning_rate
+        else:
+            solver_kwargs['damping'] = 0.01
 
         # Build per-opt-variable weights when use_base + base_weight is
         # active. The virtual chain joints are always the leading non-mimic

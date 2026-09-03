@@ -198,9 +198,10 @@ def create_self_collision_pairs(link_list, ignore_adjacent=True):
     """
     n_links = len(link_list)
     pairs = []
+    start_offset = 2 if ignore_adjacent else 1
 
     for i in range(n_links):
-        for j in range(i + 2, n_links):  # Skip i and i+1 (adjacent)
+        for j in range(i + start_offset, n_links):
             pairs.append((i, j))
 
     return pairs

@@ -51,6 +51,7 @@ from skrobot.collision.geometry import Sphere
 
 # Robot collision
 from skrobot.collision.robot_collision import LinkCollisionGeometry
+from skrobot.collision.robot_collision import primitive_obstacle_to_geometry
 from skrobot.collision.robot_collision import RobotCollisionChecker
 
 
@@ -75,4 +76,5 @@ __all__ = [
     # Robot collision
     'RobotCollisionChecker',
     'LinkCollisionGeometry',
+    'primitive_obstacle_to_geometry',
 ]

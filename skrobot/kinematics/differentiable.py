@@ -3970,8 +3970,158 @@ def _create_jax_jacobian_solver(fk_params, backend):
     return solve
 
 
+def _compute_collision_link_offsets(link_list, collision_link_list, fk_params):
+    """Express each collision link as a rigid offset from a link in ``link_list``.
+
+    So its world pose can be derived from :func:`forward_kinematics` without
+    recomputing FK for links outside the optimized chain: identity offset if
+    the collision link is itself in ``link_list``, the constant transform
+    from the nearest ancestor if it's a fixed descendant (e.g. a fingertip),
+    or static in the chain's base frame otherwise.
+
+    Returns
+    -------
+    dict
+        'chain_idx' (n,) index into link_list, 'offset_pos' (n, 3),
+        'offset_rot' (n, 3, 3), 'is_static' (n,) bool.
+    """
+    link_to_idx = {link: idx for idx, link in enumerate(link_list)}
+    base_position = np.asarray(fk_params['base_position'])
+    base_rotation = np.asarray(fk_params['base_rotation'])
+
+    chain_idx = []
+    offset_pos = []
+    offset_rot = []
+    is_static = []
+
+    for link in collision_link_list:
+        if link in link_to_idx:
+            chain_idx.append(link_to_idx[link])
+            offset_pos.append(np.zeros(3))
+            offset_rot.append(np.eye(3))
+            is_static.append(False)
+            continue
+
+        parent = link.parent_link
+        while parent is not None and parent not in link_to_idx:
+            parent = parent.parent_link
+
+        if parent is not None:
+            chain_idx.append(link_to_idx[parent])
+            parent_coords = parent.worldcoords()
+            link_coords = link.worldcoords()
+            rel_pos = parent_coords.inverse_transform_vector(
+                link_coords.worldpos())
+            rel_rot = parent_coords.worldrot().T @ link_coords.worldrot()
+            offset_pos.append(rel_pos)
+            offset_rot.append(rel_rot)
+            is_static.append(False)
+        else:
+            link_coords = link.worldcoords()
+            chain_idx.append(0)
+            offset_pos.append(
+                base_rotation.T @ (link_coords.worldpos() - base_position))
+            offset_rot.append(base_rotation.T @ link_coords.worldrot())
+            is_static.append(True)
+
+    return {
+        'chain_idx': np.array(chain_idx, dtype=np.int64),
+        'offset_pos': np.array(offset_pos),
+        'offset_rot': np.array(offset_rot),
+        'is_static': np.array(is_static, dtype=bool),
+    }
+
+
+def _build_collision_setup(link_list, fk_params, collision_link_list,
+                           obstacles, n_spheres_per_link, self_collision,
+                           ignore_adjacent_self_collision=True):
+    """Precompute the constant (non-traced) data needed for a collision cost.
+
+    Approximates every link in ``collision_link_list`` with a handful of
+    spheres, locates each sphere relative to a link in ``link_list`` (see
+    :func:`_compute_collision_link_offsets`), and converts ``obstacles`` to
+    analytical world-frame collision geometry.
+
+    Returns
+    -------
+    dict or None
+        None if ``collision_link_list`` is empty. Otherwise a dict with
+        'chain_idx', 'local_center', 'static_center', 'is_static', 'radii'
+        (all length n_spheres), 'obstacles' (list of CollisionGeometry), and
+        'self_pairs' (tuple of index arrays, or None).
+    """
+    if not collision_link_list:
+        return None
+
+    from skrobot.collision.robot_collision import primitive_obstacle_to_geometry
+    from skrobot.planner.trajectory_optimization.collision import create_self_collision_pairs
+    from skrobot.planner.trajectory_optimization.collision import extract_collision_spheres
+
+    sphere_data = extract_collision_spheres(
+        None, collision_link_list, n_spheres_per_link=n_spheres_per_link)
+    # trimesh.bounds.minimum_cylinder occasionally returns a spurious
+    # near-zero imaginary component; discard it before tracing with JAX.
+    sphere_centers_local = np.asarray(
+        sphere_data['sphere_centers_local']).real.astype(np.float64)
+    sphere_radii = np.asarray(sphere_data['sphere_radii']).real.astype(np.float64)
+    sphere_link_idx = sphere_data['link_indices']
+    n_spheres = len(sphere_radii)
+
+    offsets = _compute_collision_link_offsets(
+        link_list, collision_link_list, fk_params)
+    base_position = np.asarray(fk_params['base_position'])
+    base_rotation = np.asarray(fk_params['base_rotation'])
+
+    local_center = np.zeros((n_spheres, 3))
+    static_center = np.zeros((n_spheres, 3))
+    for i in range(n_spheres):
+        li = sphere_link_idx[i]
+        local_center[i] = (offsets['offset_pos'][li]
+                           + offsets['offset_rot'][li] @ sphere_centers_local[i])
+        if offsets['is_static'][li]:
+            static_center[i] = base_position + base_rotation @ local_center[i]
+
+    obstacle_geoms = []
+    for obs in (obstacles or []):
+        if callable(obs) and not hasattr(obs, 'worldpos'):
+            raise TypeError(
+                "batch_inverse_kinematics collision avoidance only supports "
+                "analytical primitive obstacles (skrobot.model.primitives "
+                "Sphere/Box/Cylinder, or skrobot.collision geometry); "
+                "SDF/callable obstacles are not supported.")
+        obstacle_geoms.append(primitive_obstacle_to_geometry(obs))
+
+    self_pairs = None
+    if self_collision:
+        link_pairs = create_self_collision_pairs(
+            collision_link_list, ignore_adjacent=ignore_adjacent_self_collision)
+        pairs_i, pairs_j = [], []
+        for li, lj in link_pairs:
+            idx_i = np.where(sphere_link_idx == li)[0]
+            idx_j = np.where(sphere_link_idx == lj)[0]
+            for si in idx_i:
+                for sj in idx_j:
+                    pairs_i.append(int(si))
+                    pairs_j.append(int(sj))
+        if pairs_i:
+            self_pairs = (np.array(pairs_i), np.array(pairs_j))
+
+    return {
+        'chain_idx': offsets['chain_idx'][sphere_link_idx],
+        'local_center': local_center,
+        'static_center': static_center,
+        'is_static': offsets['is_static'][sphere_link_idx],
+        'radii': sphere_radii,
+        'obstacles': obstacle_geoms,
+        'self_pairs': self_pairs,
+    }
+
+
 def create_batch_ik_solver(robot_model, link_list, move_target,
-                           backend_name='jax', method='jacobian'):
+                           backend_name='jax', method='jacobian',
+                           collision_link_list=None, collision_obstacles=None,
+                           self_collision=False, n_spheres_per_link=3,
+                           ignore_adjacent_self_collision=True):
     """Create a high-performance batch IK solver.
 
     This is the recommended way to solve batch IK problems. It:
@@ -3996,6 +4146,24 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
           Recommended for most use cases.
         - 'gradient_descent': Uses gradient descent optimization.
           More flexible for custom cost functions but slower convergence.
+    collision_link_list : list or None
+        Links to approximate with collision spheres for interference
+        avoidance. Required (non-empty) when ``collision_obstacles`` is
+        given or ``self_collision`` is True. Only supported with
+        ``method='gradient_descent'`` and ``backend_name='jax'``.
+    collision_obstacles : list or None
+        World-frame obstacles to avoid, as ``skrobot.model.primitives``
+        objects (``Sphere``, ``Box``, ``Cylinder``) or ``skrobot.collision``
+        geometry. SDF/callable obstacles are not supported here.
+    self_collision : bool
+        If True, also penalize collisions between pairs of links in
+        ``collision_link_list`` (adjacent links in the chain are ignored).
+        Default is False.
+    n_spheres_per_link : int
+        Number of swept spheres approximating each collision link.
+    ignore_adjacent_self_collision : bool
+        If True (default), skip self-collision pairs between adjacent links
+        in ``collision_link_list``.
 
     Returns
     -------
@@ -4028,6 +4196,11 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
     is_multi_ee = (isinstance(link_list, list) and len(link_list) > 0
                    and isinstance(link_list[0], list))
     if is_multi_ee:
+        if collision_link_list or collision_obstacles or self_collision:
+            raise NotImplementedError(
+                "Collision avoidance (collision_link_list/"
+                "collision_obstacles/self_collision) is not yet supported "
+                "for multi-EE batch IK.")
         if not (isinstance(move_target, list)
                 and len(move_target) == len(link_list)):
             raise ValueError(
@@ -4050,6 +4223,29 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
     # Extract FK parameters
     fk_params = extract_fk_parameters(robot_model, link_list, move_target)
+
+    wants_collision_avoidance = bool(collision_obstacles) or self_collision
+    if wants_collision_avoidance and not collision_link_list:
+        raise ValueError(
+            "collision_link_list must be a non-empty list of links when "
+            "collision_obstacles is given or self_collision=True.")
+    if wants_collision_avoidance and backend_name != 'jax':
+        raise ValueError(
+            "Collision avoidance requires backend_name='jax' (got {!r}); "
+            "the collision penalty term needs JAX autodiff.".format(
+                backend_name))
+    if wants_collision_avoidance and method != 'gradient_descent':
+        raise ValueError(
+            "Collision avoidance requires method='gradient_descent'; the "
+            "'jacobian' (damped least-squares) solver cannot incorporate a "
+            "collision penalty term.")
+
+    collision_setup = None
+    if wants_collision_avoidance:
+        collision_setup = _build_collision_setup(
+            link_list, fk_params, collision_link_list, collision_obstacles,
+            n_spheres_per_link, self_collision,
+            ignore_adjacent_self_collision=ignore_adjacent_self_collision)
 
     # Use optimized NumPy solver for numpy backend
     if backend_name == 'numpy':
@@ -4110,8 +4306,62 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
     def _create_solver_fn(max_iterations, learning_rate, pos_weight, rot_weight,
                           pos_threshold, rot_threshold, pos_mask_arr, rot_mask_arr,
-                          rotation_mirror):
+                          rotation_mirror, collision_weight, collision_activation_distance,
+                          self_collision_weight, self_collision_activation_distance):
         """Create a JIT-compiled solver for given parameters."""
+
+        # Precompute collision geometry constants (closed over, not batched).
+        if collision_setup is not None:
+            import jax.numpy as _jnp
+
+            from skrobot.collision.distance import collision_distance as _collision_distance
+            from skrobot.collision.distance import colldist_from_sdf as _colldist_from_sdf
+            from skrobot.collision.distance import sphere_sphere_distance as _sphere_sphere_distance
+            from skrobot.collision.geometry import Sphere as _Sphere
+
+            _col_chain_idx = collision_setup['chain_idx']
+            _col_is_static = collision_setup['is_static']
+            _col_local_center = backend.array(collision_setup['local_center'])
+            _col_static_center = backend.array(collision_setup['static_center'])
+            _col_radii = collision_setup['radii']
+            _col_obstacles = collision_setup['obstacles']
+            _col_self_pairs = collision_setup['self_pairs']
+            _n_col_spheres = len(_col_radii)
+
+            def _collision_sphere_centers(positions, rotations):
+                centers = []
+                for i in range(_n_col_spheres):
+                    if _col_is_static[i]:
+                        centers.append(_col_static_center[i])
+                    else:
+                        ci = int(_col_chain_idx[i])
+                        centers.append(
+                            positions[ci]
+                            + backend.matmul(rotations[ci], _col_local_center[i]))
+                return centers
+
+            def _collision_cost(positions, rotations):
+                centers = _collision_sphere_centers(positions, rotations)
+                cost = 0.0
+                for i in range(_n_col_spheres):
+                    sph = _Sphere(center=centers[i], radius=_col_radii[i])
+                    for obs in _col_obstacles:
+                        dist = _collision_distance(sph, obs, xp=_jnp)
+                        cost = cost - _colldist_from_sdf(
+                            dist, collision_activation_distance, xp=_jnp
+                        ) * collision_weight
+                if _col_self_pairs is not None:
+                    pairs_i, pairs_j = _col_self_pairs
+                    for a, b in zip(pairs_i, pairs_j):
+                        sph_a = _Sphere(center=centers[int(a)], radius=_col_radii[int(a)])
+                        sph_b = _Sphere(center=centers[int(b)], radius=_col_radii[int(b)])
+                        dist = _sphere_sphere_distance(sph_a, sph_b, xp=_jnp)
+                        cost = cost - _colldist_from_sdf(
+                            dist, self_collision_activation_distance, xp=_jnp
+                        ) * self_collision_weight
+                return cost
+        else:
+            _collision_cost = None
 
         # Convert masks to backend arrays
         pos_mask = backend.array(pos_mask_arr)
@@ -4180,7 +4430,13 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             else:
                 rot_err = compute_rot_error_single(rot, target_rot)
 
-            return pos_weight * pos_err + rot_weight * rot_err
+            total = pos_weight * pos_err + rot_weight * rot_err
+
+            if _collision_cost is not None:
+                positions, rotations = forward_kinematics(backend, full_angles, fk_params)
+                total = total + _collision_cost(positions, rotations)
+
+            return total
 
         loss_and_grad = backend.value_and_grad(loss_fn)
 
@@ -4285,7 +4541,11 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
               rotation_mirror=None,
               attempts_per_pose=1,
               use_current_angles=True,
-              select_closest_to_initial=False):
+              select_closest_to_initial=False,
+              collision_weight=10.0,
+              collision_activation_distance=0.05,
+              self_collision_weight=None,
+              self_collision_activation_distance=0.02):
         """Solve batch IK.
 
         Parameters
@@ -4342,6 +4602,20 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             If True and attempts_per_pose > 1, use initial_angles as the first
             attempt (like viser's strategy). Remaining attempts use random
             initial values. Default is True.
+        collision_weight : float
+            Weight of the collision-avoidance penalty against world
+            obstacles. Only used when this solver was created with
+            ``collision_obstacles``. Default is 10.0.
+        collision_activation_distance : float
+            Distance (in meters) from an obstacle at which the collision
+            penalty starts to activate. Default is 0.05.
+        self_collision_weight : float or None
+            Weight of the self-collision penalty. Defaults to
+            ``collision_weight`` when None. Only used when this solver was
+            created with ``self_collision=True``.
+        self_collision_activation_distance : float
+            Distance (in meters) between collision links at which the
+            self-collision penalty starts to activate. Default is 0.02.
 
         Returns
         -------
@@ -4425,14 +4699,21 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
         # Get or create JIT-compiled solver for these parameters
         # Include masks, thresholds, and mirror in cache key
+        resolved_self_collision_weight = (
+            collision_weight if self_collision_weight is None
+            else self_collision_weight)
         cache_key = (max_iterations, learning_rate, pos_weight, rot_weight,
                      pos_threshold, rot_threshold,
-                     tuple(pos_mask_arr), tuple(rot_mask_arr), rotation_mirror)
+                     tuple(pos_mask_arr), tuple(rot_mask_arr), rotation_mirror,
+                     collision_weight, collision_activation_distance,
+                     resolved_self_collision_weight,
+                     self_collision_activation_distance)
         if cache_key not in _jit_cache:
             _jit_cache[cache_key] = _create_solver_fn(
                 max_iterations, learning_rate, pos_weight, rot_weight,
                 pos_threshold, rot_threshold, pos_mask_arr, rot_mask_arr,
-                rotation_mirror
+                rotation_mirror, collision_weight, collision_activation_distance,
+                resolved_self_collision_weight, self_collision_activation_distance
             )
 
         solver_fn = _jit_cache[cache_key]

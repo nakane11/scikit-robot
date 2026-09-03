@@ -22,6 +22,62 @@ from skrobot.collision.geometry import HalfSpace
 from skrobot.collision.geometry import Sphere
 
 
+def primitive_obstacle_to_geometry(obstacle):
+    """Convert a world-frame obstacle object to an analytical collision geometry.
+
+    Accepts ``skrobot.model.primitives`` objects (Sphere, Box, Cylinder) and
+    converts them to the corresponding ``skrobot.collision`` geometry
+    (Sphere, Box, Capsule) evaluated at the obstacle's current world pose.
+    Objects that are already ``skrobot.collision`` geometry are returned
+    unchanged.
+
+    Parameters
+    ----------
+    obstacle : various
+        ``skrobot.model.primitives.Sphere``, ``Box``, ``Cylinder``, or an
+        already-constructed ``skrobot.collision`` geometry instance.
+
+    Returns
+    -------
+    CollisionGeometry
+        Analytical collision geometry in world frame.
+    """
+    obstacle_class = type(obstacle).__name__
+
+    if obstacle_class == 'Sphere' and hasattr(obstacle, 'worldpos'):
+        # skrobot.model.primitives.Sphere
+        radius = getattr(obstacle, 'radius', getattr(obstacle, '_radius', 0.05))
+        center = obstacle.worldpos()
+        return Sphere(center=center, radius=radius)
+
+    if obstacle_class == 'Box' and hasattr(obstacle, 'extents'):
+        # skrobot.model.primitives.Box
+        from skrobot.collision.geometry import Box as CollisionBox
+        extents = obstacle.extents
+        center = obstacle.worldpos()
+        rot = obstacle.worldrot()
+        return CollisionBox(
+            center=center,
+            half_extents=np.array(extents) / 2,
+            rotation=rot
+        )
+
+    if obstacle_class == 'Cylinder' and hasattr(obstacle, 'worldpos'):
+        # skrobot.model.primitives.Cylinder -> approximate as Capsule
+        radius = getattr(obstacle, 'radius', 0.05)
+        height = getattr(obstacle, 'height', 0.1)
+        center = obstacle.worldpos()
+        rot = obstacle.worldrot()
+        # Cylinder axis is Z in local frame
+        axis = rot @ np.array([0, 0, 1])
+        p1 = center - axis * height / 2
+        p2 = center + axis * height / 2
+        return Capsule(p1=p1, p2=p2, radius=radius)
+
+    # Otherwise, treat as CollisionGeometry for analytical distance
+    return obstacle
+
+
 class LinkCollisionGeometry:
     """Collision geometry attached to a robot link.
 
@@ -337,48 +393,9 @@ class RobotCollisionChecker:
                 self._world_sdfs.append(sdf_func)
                 return
 
-        # Check if it's a skrobot.model.primitives object
-        # These have worldpos() and can be converted to collision geometry
-        obstacle_class = type(obstacle).__name__
-
-        if obstacle_class == 'Sphere' and hasattr(obstacle, 'worldpos'):
-            # skrobot.model.primitives.Sphere
-            radius = getattr(obstacle, 'radius', getattr(obstacle, '_radius', 0.05))
-            center = obstacle.worldpos()
-            geom = Sphere(center=center, radius=radius)
-            self._world_obstacles.append(geom)
-            return
-
-        if obstacle_class == 'Box' and hasattr(obstacle, 'extents'):
-            # skrobot.model.primitives.Box
-            from skrobot.collision.geometry import Box as CollisionBox
-            extents = obstacle.extents
-            center = obstacle.worldpos()
-            rot = obstacle.worldrot()
-            geom = CollisionBox(
-                center=center,
-                half_extents=np.array(extents) / 2,
-                rotation=rot
-            )
-            self._world_obstacles.append(geom)
-            return
-
-        if obstacle_class == 'Cylinder' and hasattr(obstacle, 'worldpos'):
-            # skrobot.model.primitives.Cylinder -> approximate as Capsule
-            radius = getattr(obstacle, 'radius', 0.05)
-            height = getattr(obstacle, 'height', 0.1)
-            center = obstacle.worldpos()
-            rot = obstacle.worldrot()
-            # Cylinder axis is Z in local frame
-            axis = rot @ np.array([0, 0, 1])
-            p1 = center - axis * height / 2
-            p2 = center + axis * height / 2
-            geom = Capsule(p1=p1, p2=p2, radius=radius)
-            self._world_obstacles.append(geom)
-            return
-
-        # Otherwise, treat as CollisionGeometry for analytical distance
-        self._world_obstacles.append(obstacle)
+        # skrobot.model.primitives object or already-constructed collision
+        # geometry: convert to an analytical world-frame geometry.
+        self._world_obstacles.append(primitive_obstacle_to_geometry(obstacle))
 
     def add_ground_plane(self, height=0.0):
         """Add a ground plane as world obstacle.
