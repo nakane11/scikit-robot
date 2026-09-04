@@ -4095,8 +4095,22 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
     if self_collision:
         link_pairs = create_self_collision_pairs(
             collision_link_list, ignore_adjacent=ignore_adjacent_self_collision)
+        is_static_link = offsets['is_static']
         pairs_i, pairs_j = [], []
         for li, lj in link_pairs:
+            if is_static_link[li] and is_static_link[lj]:
+                # Neither link is a descendant of any joint in ``link_list``
+                # (the chain this call actually optimizes over), so their
+                # relative pose is a compile-time constant for this call --
+                # see ``_compute_collision_link_offsets``'s ``is_static``.
+                # Their distance can never change regardless of the
+                # decision variables, so this pair contributes a constant
+                # cost with exactly zero gradient: skip it instead of
+                # wasting every iteration on an unchanging penalty (e.g. a
+                # cart's own wheel/undercarriage links, which are all
+                # static relative to each other whenever the optimized
+                # chain is an arm rather than the undercarriage itself).
+                continue
             idx_i = np.where(sphere_link_idx == li)[0]
             idx_j = np.where(sphere_link_idx == lj)[0]
             for si in idx_i:
