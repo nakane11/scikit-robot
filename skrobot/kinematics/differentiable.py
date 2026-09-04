@@ -4034,7 +4034,8 @@ def _compute_collision_link_offsets(link_list, collision_link_list, fk_params):
 
 def _build_collision_setup(link_list, fk_params, collision_link_list,
                            obstacles, n_spheres_per_link, self_collision,
-                           ignore_adjacent_self_collision=True):
+                           ignore_adjacent_self_collision=True,
+                           collision_pairs=None):
     """Precompute the constant (non-traced) data needed for a collision cost.
 
     Approximates every link in ``collision_link_list`` with a handful of
@@ -4042,13 +4043,31 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
     :func:`_compute_collision_link_offsets`), and converts ``obstacles`` to
     analytical world-frame collision geometry.
 
+    Parameters
+    ----------
+    collision_pairs : list[tuple[Link, Link or int]] or None
+        When given, restricts which combinations are checked instead of
+        the defaults (every combination of ``collision_link_list`` for
+        self-collision, every link against every obstacle for world
+        collision). Each entry is ``(link, other)`` where ``link`` must be
+        an element of ``collision_link_list``, and ``other`` is either
+        another element of ``collision_link_list`` (a self-collision pair)
+        or an integer index into ``obstacles`` (a world-collision pair).
+        Entries classified as self-collision are only applied when
+        ``self_collision`` is True; entries classified as world-collision
+        are only applied when ``obstacles`` is non-empty. If given but
+        containing no entries of a given kind, that kind of collision cost
+        is not computed at all (an explicit empty candidate set), even if
+        ``self_collision``/``obstacles`` would otherwise enable it.
+
     Returns
     -------
     dict or None
         None if ``collision_link_list`` is empty. Otherwise a dict with
         'chain_idx', 'local_center', 'static_center', 'is_static', 'radii'
-        (all length n_spheres), 'obstacles' (list of CollisionGeometry), and
-        'self_pairs' (tuple of index arrays, or None).
+        (all length n_spheres), 'obstacles' (list of CollisionGeometry),
+        'self_pairs' (tuple of index arrays, or None), and 'obstacle_pairs'
+        (tuple of index arrays, or None).
     """
     if not collision_link_list:
         return None
@@ -4091,10 +4110,47 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
                 "SDF/callable obstacles are not supported.")
         obstacle_geoms.append(primitive_obstacle_to_geometry(obs))
 
+    link_index_by_id = {
+        id(link): i for i, link in enumerate(collision_link_list)}
+
+    explicit_self_link_pairs = None
+    explicit_obstacle_link_pairs = None
+    if collision_pairs is not None:
+        n_obstacles = len(obstacle_geoms)
+        explicit_self_link_pairs = []
+        explicit_obstacle_link_pairs = []
+        for link_a, other in collision_pairs:
+            ia = link_index_by_id.get(id(link_a))
+            if ia is None:
+                raise ValueError(
+                    "collision_pairs refers to a link ({!r}) that is not "
+                    "in collision_link_list.".format(
+                        getattr(link_a, 'name', link_a)))
+            if isinstance(other, (int, np.integer)):
+                if not (0 <= other < n_obstacles):
+                    raise ValueError(
+                        "collision_pairs refers to obstacle index {} but "
+                        "there are only {} obstacles.".format(
+                            other, n_obstacles))
+                explicit_obstacle_link_pairs.append((ia, int(other)))
+                continue
+            ib = link_index_by_id.get(id(other))
+            if ib is None:
+                raise ValueError(
+                    "collision_pairs refers to a link ({!r}) that is not "
+                    "in collision_link_list, and it is not an integer "
+                    "obstacle index either.".format(
+                        getattr(other, 'name', other)))
+            explicit_self_link_pairs.append(
+                (ia, ib) if ia < ib else (ib, ia))
+
     self_pairs = None
     if self_collision:
-        link_pairs = create_self_collision_pairs(
-            collision_link_list, ignore_adjacent=ignore_adjacent_self_collision)
+        if explicit_self_link_pairs is not None:
+            link_pairs = explicit_self_link_pairs
+        else:
+            link_pairs = create_self_collision_pairs(
+                collision_link_list, ignore_adjacent=ignore_adjacent_self_collision)
         is_static_link = offsets['is_static']
         pairs_i, pairs_j = [], []
         for li, lj in link_pairs:
@@ -4120,6 +4176,24 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
         if pairs_i:
             self_pairs = (np.array(pairs_i), np.array(pairs_j))
 
+    # Unlike ``self_pairs``, ``None`` here is meaningfully different from
+    # "restricted to zero pairs": ``None`` means no ``collision_pairs``
+    # override was requested at all, so the cost function falls back to
+    # checking every sphere against every obstacle (the historical
+    # default); a non-``None`` (possibly empty) pair of arrays means an
+    # explicit restriction was requested, including "check nothing" when
+    # ``collision_pairs`` contained no obstacle-collision entries.
+    obstacle_pairs = None
+    if collision_pairs is not None:
+        pairs_i, pairs_j = [], []
+        for li, obstacle_idx in explicit_obstacle_link_pairs:
+            idx_i = np.where(sphere_link_idx == li)[0]
+            for si in idx_i:
+                pairs_i.append(int(si))
+                pairs_j.append(obstacle_idx)
+        obstacle_pairs = (np.array(pairs_i, dtype=np.int64),
+                         np.array(pairs_j, dtype=np.int64))
+
     return {
         'chain_idx': offsets['chain_idx'][sphere_link_idx],
         'local_center': local_center,
@@ -4139,6 +4213,7 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
         # across calls.
         'obstacle_types': [type(g).__name__ for g in obstacle_geoms],
         'self_pairs': self_pairs,
+        'obstacle_pairs': obstacle_pairs,
     }
 
 
@@ -4231,7 +4306,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                            backend_name='jax', method='jacobian',
                            collision_link_list=None, collision_obstacles=None,
                            self_collision=False, n_spheres_per_link=3,
-                           ignore_adjacent_self_collision=True):
+                           ignore_adjacent_self_collision=True,
+                           collision_pairs=None):
     """Create a high-performance batch IK solver.
 
     This is the recommended way to solve batch IK problems. It:
@@ -4273,7 +4349,21 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         Number of swept spheres approximating each collision link.
     ignore_adjacent_self_collision : bool
         If True (default), skip self-collision pairs between adjacent links
-        in ``collision_link_list``.
+        in ``collision_link_list``. Ignored when ``collision_pairs`` names
+        any self-collision pairs.
+    collision_pairs : list[tuple[Link, Link or int]] or None
+        When given, restricts which combinations are checked instead of
+        the defaults (every combination of ``collision_link_list`` for
+        self-collision, every link against every obstacle for world
+        collision). Each entry is ``(link, other)`` where ``link`` must be
+        an element of ``collision_link_list``, and ``other`` is either
+        another element of ``collision_link_list`` (a self-collision pair,
+        only applied when ``self_collision`` is True) or an integer index
+        into ``collision_obstacles`` (a world-collision pair, only applied
+        when ``collision_obstacles`` is non-empty). If given but containing
+        no entries of a given kind, that kind of collision cost is not
+        computed at all, even if ``self_collision``/``collision_obstacles``
+        would otherwise enable it.
 
     Returns
     -------
@@ -4335,10 +4425,26 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
     fk_params = extract_fk_parameters(robot_model, link_list, move_target)
 
     wants_collision_avoidance = bool(collision_obstacles) or self_collision
+    if wants_collision_avoidance and not collision_link_list and collision_pairs:
+        # No explicit collision_link_list: derive it as the deduplicated
+        # links referenced by collision_pairs (in first-seen order). Each
+        # entry is (link, link) or (link, obstacle_index); only the Link
+        # values contribute to the derived list.
+        collision_link_list = []
+        seen_link_ids = set()
+        for link_a, other in collision_pairs:
+            for link in (link_a, other):
+                if isinstance(link, (int, np.integer)):
+                    continue
+                if id(link) not in seen_link_ids:
+                    seen_link_ids.add(id(link))
+                    collision_link_list.append(link)
     if wants_collision_avoidance and not collision_link_list:
         raise ValueError(
             "collision_link_list must be a non-empty list of links when "
-            "collision_obstacles is given or self_collision=True.")
+            "collision_obstacles is given or self_collision=True (unless "
+            "collision_pairs is given, in which case it is derived "
+            "automatically from the links it references).")
     if wants_collision_avoidance and backend_name != 'jax':
         raise ValueError(
             "Collision avoidance requires backend_name='jax' (got {!r}); "
@@ -4355,7 +4461,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         collision_setup = _build_collision_setup(
             link_list, fk_params, collision_link_list, collision_obstacles,
             n_spheres_per_link, self_collision,
-            ignore_adjacent_self_collision=ignore_adjacent_self_collision)
+            ignore_adjacent_self_collision=ignore_adjacent_self_collision,
+            collision_pairs=collision_pairs)
 
     # Use optimized NumPy solver for numpy backend
     if backend_name == 'numpy':
@@ -4457,6 +4564,7 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             _col_radii = collision_setup['radii']
             _col_obstacle_types = collision_setup['obstacle_types']
             _col_self_pairs = collision_setup['self_pairs']
+            _col_obstacle_pairs = collision_setup['obstacle_pairs']
             _n_col_spheres = len(_col_radii)
 
             def _collision_sphere_centers(positions, rotations):
@@ -4478,13 +4586,28 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                     for obstacle_type, values in zip(
                         _col_obstacle_types, obstacle_values)]
                 cost = 0.0
-                for i in range(_n_col_spheres):
-                    sph = _Sphere(center=centers[i], radius=_col_radii[i])
-                    for obs in obstacles:
+                if _col_obstacle_pairs is not None:
+                    # An explicit collision_pairs override was given (even
+                    # if it names zero obstacle pairs, in which case this
+                    # loop iterates zero times): only check the requested
+                    # (sphere, obstacle) combinations instead of every
+                    # sphere against every obstacle.
+                    pairs_i, pairs_j = _col_obstacle_pairs
+                    for a, b in zip(pairs_i, pairs_j):
+                        sph = _Sphere(center=centers[int(a)], radius=_col_radii[int(a)])
+                        obs = obstacles[int(b)]
                         dist = _collision_distance(sph, obs, xp=_jnp)
                         cost = cost - _colldist_from_sdf(
                             dist, collision_activation_distance, xp=_jnp
                         ) * collision_weight
+                else:
+                    for i in range(_n_col_spheres):
+                        sph = _Sphere(center=centers[i], radius=_col_radii[i])
+                        for obs in obstacles:
+                            dist = _collision_distance(sph, obs, xp=_jnp)
+                            cost = cost - _colldist_from_sdf(
+                                dist, collision_activation_distance, xp=_jnp
+                            ) * collision_weight
                 if _col_self_pairs is not None:
                     pairs_i, pairs_j = _col_self_pairs
                     for a, b in zip(pairs_i, pairs_j):

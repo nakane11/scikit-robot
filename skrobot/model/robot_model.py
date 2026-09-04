@@ -3646,6 +3646,7 @@ class RobotModel(CascadedLink):
             collision_link_list=None,
             collision_obstacles=None,
             self_collision=False,
+            collision_pairs=None,
             collision_weight=10.0,
             collision_margin=0.05,
             self_collision_weight=None,
@@ -3753,17 +3754,41 @@ class RobotModel(CascadedLink):
         collision_link_list : list[skrobot.model.Link] or None
             Links to approximate with collision spheres for interference
             avoidance. Required (non-empty) when ``collision_obstacles`` is
-            given or ``self_collision=True``. Switches the solver to a
-            gradient-descent method with the collision distance as a soft
-            penalty term, and requires ``backend='jax'``.
+            given or ``self_collision=True``, unless ``collision_pairs``
+            is given, in which case it is derived automatically as the
+            links referenced by ``collision_pairs``. Switches the solver
+            to a gradient-descent method with the collision distance as a
+            soft penalty term, and requires ``backend='jax'``.
         collision_obstacles : list or None
             World-frame obstacles to avoid, as ``skrobot.model.primitives``
             objects (``Sphere``, ``Box``, ``Cylinder``) or ``skrobot.collision``
             geometry. SDF/mesh obstacles are not supported for batch IK.
         self_collision : bool
-            If True, also penalize collisions between pairs of links in
-            ``collision_link_list``. Requires ``collision_link_list``.
+            If True, also penalize collisions between pairs of links (see
+            ``collision_pairs`` to restrict which pairs). Requires
+            ``collision_link_list`` unless ``collision_pairs`` is given.
             Default is False.
+        collision_pairs : list[tuple[skrobot.model.Link, skrobot.model.Link or int]] or None
+            When given, restricts which combinations are checked instead
+            of the defaults (every combination of ``collision_link_list``
+            for self-collision, every link against every obstacle for
+            world/human collision). Each entry is ``(link, other)`` where
+            ``link`` must be an element of ``collision_link_list`` (or, if
+            ``collision_link_list`` is omitted, any link -- it is then
+            derived automatically as the deduplicated links referenced
+            here), and ``other`` is either:
+
+            - another link (a self-collision pair, only applied when
+              ``self_collision=True``; ``ignore_adjacent_self_collision``
+              is ignored in that case), or
+            - an integer index into ``collision_obstacles`` (a
+              world/human-collision pair, only applied when
+              ``collision_obstacles`` is non-empty).
+
+            If given but containing no entries of a given kind, that kind
+            of collision cost is not computed at all, even if
+            ``self_collision``/``collision_obstacles`` would otherwise
+            enable it.
         collision_weight : float
             Weight of the world-obstacle collision penalty. Default is 10.0.
         collision_margin : float
@@ -3896,6 +3921,7 @@ class RobotModel(CascadedLink):
                 collision_link_list=collision_link_list,
                 collision_obstacles=collision_obstacles,
                 self_collision=self_collision,
+                collision_pairs=collision_pairs,
                 collision_weight=collision_weight,
                 collision_margin=collision_margin,
                 self_collision_weight=self_collision_weight,
@@ -3924,6 +3950,7 @@ class RobotModel(CascadedLink):
         collision_link_list = kwargs.pop('collision_link_list', None)
         collision_obstacles = kwargs.pop('collision_obstacles', None)
         self_collision = kwargs.pop('self_collision', False)
+        collision_pairs = kwargs.pop('collision_pairs', None)
         collision_weight = kwargs.pop('collision_weight', 10.0)
         collision_margin = kwargs.pop('collision_margin', 0.05)
         self_collision_weight = kwargs.pop('self_collision_weight', None)
@@ -3933,10 +3960,29 @@ class RobotModel(CascadedLink):
             'ignore_adjacent_self_collision', True)
         collision_learning_rate = kwargs.pop('collision_learning_rate', 0.5)
         wants_collision_avoidance = bool(collision_obstacles) or self_collision
+        if (wants_collision_avoidance and not collision_link_list
+                and collision_pairs):
+            # No explicit collision_link_list: derive it as the
+            # deduplicated links referenced by collision_pairs (in
+            # first-seen order) so callers that only care about specific
+            # collision pairs don't have to separately assemble and pass
+            # the full link set themselves. Each entry is (link, link) or
+            # (link, obstacle_index); only the Link values contribute.
+            collision_link_list = []
+            seen_link_ids = set()
+            for link_a, other in collision_pairs:
+                for link in (link_a, other):
+                    if isinstance(link, (int, np.integer)):
+                        continue
+                    if id(link) not in seen_link_ids:
+                        seen_link_ids.add(id(link))
+                        collision_link_list.append(link)
         if wants_collision_avoidance and not collision_link_list:
             raise ValueError(
                 "collision_link_list must be a non-empty list of links when "
-                "collision_obstacles is given or self_collision=True.")
+                "collision_obstacles is given or self_collision=True "
+                "(unless collision_pairs is given, in which case it is "
+                "derived automatically from the links it references).")
         if wants_collision_avoidance and _base_weight is not None:
             raise ValueError(
                 "base_weight cannot be combined with collision avoidance "
@@ -4142,6 +4188,9 @@ class RobotModel(CascadedLink):
                 tuple(id(link) for link in collision_link_list),
                 obstacle_type_sig,
                 self_collision,
+                (tuple((id(a), id(b) if not isinstance(b, (int, np.integer))
+                       else b) for a, b in collision_pairs)
+                 if collision_pairs is not None else None),
                 n_spheres_per_link,
                 ignore_adjacent_self_collision,
             )
@@ -4155,6 +4204,7 @@ class RobotModel(CascadedLink):
                         collision_link_list=collision_link_list,
                         collision_obstacles=collision_obstacles,
                         self_collision=self_collision,
+                        collision_pairs=collision_pairs,
                         n_spheres_per_link=n_spheres_per_link,
                         ignore_adjacent_self_collision=ignore_adjacent_self_collision)
             solver = self._batch_ik_collision_solver_cache[collision_cache_key]
