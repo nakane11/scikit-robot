@@ -3829,6 +3829,7 @@ def _create_jax_jacobian_solver(fk_params, backend):
               attempts_per_pose=1,
               use_current_angles=True,
               select_closest_to_initial=False,
+              return_all_attempts=False,
               joint_weights=None,
               **kwargs):
         """Solve batch IK using Jacobian-based method.
@@ -3850,7 +3851,8 @@ def _create_jax_jacobian_solver(fk_params, backend):
         rot_threshold : float
             Rotation error threshold for success.
         position_mask, rotation_mask, rotation_mirror, attempts_per_pose,
-        use_current_angles, select_closest_to_initial : same as gradient descent solver.
+        use_current_angles, select_closest_to_initial, return_all_attempts :
+            same as gradient descent solver.
 
         Returns
         -------
@@ -3942,8 +3944,9 @@ def _create_jax_jacobian_solver(fk_params, backend):
         all_solutions, all_success, all_errors = solver_fn(
             initial_opt_angles, target_positions_solve, target_rotations_solve)
 
-        # Select best from multiple attempts
-        if attempts_per_pose > 1:
+        # Select best from multiple attempts (unless the caller asked for
+        # every attempt to be returned).
+        if attempts_per_pose > 1 and not return_all_attempts:
             all_solutions_np = backend.to_numpy(all_solutions)
             all_success_np = backend.to_numpy(all_success)
             all_errors_np = backend.to_numpy(all_errors)
@@ -4818,6 +4821,7 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
               attempts_per_pose=1,
               use_current_angles=True,
               select_closest_to_initial=False,
+              return_all_attempts=False,
               collision_weight=10.0,
               collision_activation_distance=0.05,
               self_collision_weight=None,
@@ -4879,6 +4883,15 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             If True and attempts_per_pose > 1, use initial_angles as the first
             attempt (like viser's strategy). Remaining attempts use random
             initial values. Default is True.
+        return_all_attempts : bool
+            If True, skip the best-of-attempts selection and return every
+            attempt's solution: the returned arrays have
+            ``n_targets * attempts_per_pose`` rows, ordered target-major
+            (target 0's attempts 0..N-1, then target 1's, ...), matching the
+            ``np.repeat`` expansion of the targets. Use it when the caller
+            wants to post-process the attempts itself (the lowest-error
+            solution is not necessarily the one a downstream check accepts).
+            Default is False.
         collision_weight : float
             Weight of the collision-avoidance penalty against world
             obstacles. Only used when this solver was created with
@@ -5055,7 +5068,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         )
 
         # If multiple attempts, select best solution for each target
-        if attempts_per_pose > 1:
+        # (unless the caller asked for every attempt to be returned).
+        if attempts_per_pose > 1 and not return_all_attempts:
             # Convert to numpy for selection
             all_solutions_np = backend.to_numpy(all_solutions)
             all_success_np = backend.to_numpy(all_success)

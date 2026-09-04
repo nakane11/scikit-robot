@@ -3634,6 +3634,7 @@ class RobotModel(CascadedLink):
             initial_angles="current",
             alpha=1.0,
             attempts_per_pose=1,
+            return_all_attempts=False,
             random_initial_range=0.7,
             translation_tolerance=None,
             rotation_tolerance=None,
@@ -3712,6 +3713,17 @@ class RobotModel(CascadedLink):
             Step size for gradient descent (0 < alpha <= 1)
         attempts_per_pose : int
             Number of attempts with different random initial poses per target (default: 1)
+        return_all_attempts : bool
+            If True, return every attempt's solution instead of only the
+            best one per target: the returned lists have
+            ``len(target_coords) * attempts_per_pose`` entries, ordered
+            target-major (target 0's attempts 0..N-1, then target 1's,
+            ...). Use it when the caller wants to screen the attempts
+            itself -- the lowest-error solution is not necessarily the one
+            a downstream check (collision verification, a second IK stage,
+            ...) accepts, and the discarded attempts are solved anyway.
+            Only supported for ``backend='jax'`` single-end-effector
+            solves; ``ValueError`` otherwise. Default is False.
         random_initial_range : float
             Range for random initial poses as fraction of joint limits (0.0-1.0, default: 0.7)
         translation_tolerance : list or None
@@ -3918,6 +3930,7 @@ class RobotModel(CascadedLink):
                 rotation_tolerance, backend=backend,
                 _base_state=_base_state,
                 base_weight=base_weight,
+                return_all_attempts=return_all_attempts,
                 collision_link_list=collision_link_list,
                 collision_obstacles=collision_obstacles,
                 self_collision=self_collision,
@@ -3959,6 +3972,7 @@ class RobotModel(CascadedLink):
         ignore_adjacent_self_collision = kwargs.pop(
             'ignore_adjacent_self_collision', True)
         collision_learning_rate = kwargs.pop('collision_learning_rate', 0.5)
+        return_all_attempts = kwargs.pop('return_all_attempts', False)
         wants_collision_avoidance = bool(collision_obstacles) or self_collision
         if (wants_collision_avoidance and not collision_link_list
                 and collision_pairs):
@@ -4025,6 +4039,10 @@ class RobotModel(CascadedLink):
                 raise NotImplementedError(
                     "Collision avoidance (collision_obstacles/"
                     "self_collision) is not yet supported for multi-EE "
+                    "batch_inverse_kinematics.")
+            if return_all_attempts:
+                raise ValueError(
+                    "return_all_attempts is not supported for multi-EE "
                     "batch_inverse_kinematics.")
             return self._batch_inverse_kinematics_multi_ee_impl(
                 target_coords, move_target, link_list,
@@ -4225,6 +4243,12 @@ class RobotModel(CascadedLink):
             attempts_per_pose=attempts_per_pose,
             use_current_angles=use_current_angles,
         )
+        if return_all_attempts:
+            if backend != 'jax':
+                raise ValueError(
+                    "return_all_attempts requires backend='jax' (got "
+                    "{!r}).".format(backend))
+            solver_kwargs['return_all_attempts'] = True
         if wants_collision_avoidance:
             solver_kwargs['collision_weight'] = collision_weight
             solver_kwargs['collision_activation_distance'] = collision_margin
@@ -4276,6 +4300,10 @@ class RobotModel(CascadedLink):
         # Expand solutions to full angle vector
         # The FK solver returns angles for ALL joints in link_list (including mimic)
         # We need to map only the non-mimic joints to the robot's full angle vector
+        # With return_all_attempts the solver returns one row per
+        # (target, attempt) instead of one per target, so drive the loops
+        # below off the actual number of rows rather than n_poses.
+        n_solutions = solutions_np.shape[0]
         full_solutions = []
         full_av_org = self.angle_vector()
 
@@ -4286,7 +4314,7 @@ class RobotModel(CascadedLink):
             if joint in link_joint_list:
                 fk_indices_for_actual_joints.append(link_joint_list.index(joint))
 
-        for i in range(n_poses):
+        for i in range(n_solutions):
             solution = solutions_np[i]
             full_av = full_av_org.copy()
             for j, (robot_joint_idx, fk_idx) in enumerate(zip(joint_indices, fk_indices_for_actual_joints)):
@@ -4297,7 +4325,7 @@ class RobotModel(CascadedLink):
         success_flags = [bool(s) for s in success_np]
 
         # Compute attempt counts (backend always uses all attempts, return attempts_per_pose)
-        attempt_counts = [attempts_per_pose] * n_poses
+        attempt_counts = [attempts_per_pose] * n_solutions
 
         if _base_state is not None:
             # Virtual chain joints occupy the first n_dof positions of
@@ -4307,7 +4335,7 @@ class RobotModel(CascadedLink):
             base_poses = [
                 self._virtual_chain_angles_to_base_pose(
                     solutions_np[i, :n_dof], _base_state['use_base'])
-                for i in range(n_poses)
+                for i in range(n_solutions)
             ]
             return full_solutions, base_poses, success_flags, attempt_counts
 
