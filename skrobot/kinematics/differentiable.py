@@ -4113,8 +4113,104 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
         'is_static': offsets['is_static'][sphere_link_idx],
         'radii': sphere_radii,
         'obstacles': obstacle_geoms,
+        # Type name (``'Sphere'``/``'Capsule'``/``'Box'``) of each entry in
+        # ``obstacles``, in order. This is the *shape* that a call-time
+        # ``collision_obstacles`` override passed to ``solve()`` must match
+        # (see ``_pack_obstacle_values`` and ``solve``'s ``collision_
+        # obstacles`` parameter) -- values may differ freely, but the
+        # sequence of primitive types (hence array count/shapes) must not,
+        # or the traced/compiled solver would either raise a pytree
+        # mismatch or (worse) silently reuse a stale compiled program with
+        # wrong obstacle count when the compiler cache tries to be reused
+        # across calls.
+        'obstacle_types': [type(g).__name__ for g in obstacle_geoms],
         'self_pairs': self_pairs,
     }
+
+
+def _pack_obstacle_values(obstacle_geoms, backend):
+    """Pack a list of ``skrobot.collision`` geometry objects into a nested
+    list-of-tuples-of-arrays pytree that JAX can trace as a *runtime*
+    argument (as opposed to closing over the geometry objects as Python
+    constants baked into the compiled program at trace time).
+
+    The returned structure only ever contains array leaves (never a type
+    tag or other static Python value), so as long as ``obstacle_geoms``
+    has the same length and the same primitive type at each position
+    across calls, JAX sees the exact same pytree *shape* every time and a
+    previously JIT-compiled solver can be reused with new obstacle values
+    -- this is what lets ``batch_inverse_kinematics``'s collision-avoidance
+    solver be cached across calls (see ``skrobot.model.RobotModel.
+    batch_inverse_kinematics``'s ``_batch_ik_collision_solver_cache``)
+    instead of recompiling (~minutes) for every call.
+
+    Parameters
+    ----------
+    obstacle_geoms : list of skrobot.collision.geometry.CollisionGeometry
+        ``Sphere``, ``Capsule``, or ``Box`` instances (world frame).
+    backend : Backend
+        Backend whose ``.array()`` is used to build the leaves (so the
+        result works for both the NumPy and JAX code paths).
+
+    Returns
+    -------
+    list of tuple
+        One tuple of backend arrays per obstacle: ``(center, radius)`` for
+        ``Sphere``, ``(p1, p2, radius)`` for ``Capsule``, ``(center,
+        half_extents, rotation)`` for ``Box`` (rotation defaults to the
+        identity matrix when the source ``Box`` has ``rotation=None``, so
+        the leaf is always a plain array, never ``None``).
+    """
+    packed = []
+    for g in obstacle_geoms:
+        cls = type(g).__name__
+        if cls == 'Sphere':
+            packed.append((
+                backend.array(np.asarray(g.center, dtype=np.float64)),
+                backend.array(np.asarray(g.radius, dtype=np.float64)),
+            ))
+        elif cls == 'Capsule':
+            packed.append((
+                backend.array(np.asarray(g.p1, dtype=np.float64)),
+                backend.array(np.asarray(g.p2, dtype=np.float64)),
+                backend.array(np.asarray(g.radius, dtype=np.float64)),
+            ))
+        elif cls == 'Box':
+            rotation = g.rotation if g.rotation is not None else np.eye(3)
+            packed.append((
+                backend.array(np.asarray(g.center, dtype=np.float64)),
+                backend.array(np.asarray(g.half_extents, dtype=np.float64)),
+                backend.array(np.asarray(rotation, dtype=np.float64)),
+            ))
+        else:
+            raise TypeError(
+                "Unsupported collision obstacle geometry for batch IK: "
+                "{!r} (supported: Sphere, Capsule, Box)".format(cls))
+    return packed
+
+
+def _obstacle_geometry_from_values(obstacle_type, values):
+    """Inverse of ``_pack_obstacle_values`` for a single obstacle: rebuild
+    the ``skrobot.collision`` geometry object (holding whatever array
+    leaves -- constants or JAX tracers -- ``values`` contains) from its
+    static type name and packed values tuple."""
+    from skrobot.collision.geometry import Box as _Box
+    from skrobot.collision.geometry import Capsule as _Capsule
+    from skrobot.collision.geometry import Sphere as _Sphere
+
+    if obstacle_type == 'Sphere':
+        center, radius = values
+        return _Sphere(center=center, radius=radius)
+    if obstacle_type == 'Capsule':
+        p1, p2, radius = values
+        return _Capsule(p1=p1, p2=p2, radius=radius)
+    if obstacle_type == 'Box':
+        center, half_extents, rotation = values
+        return _Box(center=center, half_extents=half_extents,
+                   rotation=rotation)
+    raise TypeError(
+        "Unsupported collision obstacle geometry for batch IK: {!r} "
+        "(supported: Sphere, Capsule, Box)".format(obstacle_type))
 
 
 def create_batch_ik_solver(robot_model, link_list, move_target,
@@ -4253,6 +4349,15 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
     backend = get_backend(backend_name)
 
+    # Obstacle values this solver is created with, packed to the pytree
+    # shape ``solve()``'s ``collision_obstacles`` override must match (see
+    # ``_pack_obstacle_values``). Computed once here (not per
+    # ``_create_solver_fn``/cache-key variant) since it only depends on
+    # ``collision_setup``, which is fixed for the life of this solver.
+    default_obstacle_values = (
+        _pack_obstacle_values(collision_setup['obstacles'], backend)
+        if collision_setup is not None else ())
+
     # Use Jacobian-based solver for JAX (faster)
     if method == 'jacobian' and backend_name == 'jax':
         return _create_jax_jacobian_solver(fk_params, backend)
@@ -4310,7 +4415,19 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                           self_collision_weight, self_collision_activation_distance):
         """Create a JIT-compiled solver for given parameters."""
 
-        # Precompute collision geometry constants (closed over, not batched).
+        # Precompute collision geometry. The robot-side sphere geometry
+        # (``_col_local_center``/``_col_static_center``/``_col_radii``/
+        # ``_col_chain_idx``/``_col_self_pairs``) only depends on the robot
+        # and ``collision_link_list``, so it is safe to close over as
+        # constants -- it cannot change between calls to a cached solver
+        # (see ``RobotModel.batch_inverse_kinematics``'s
+        # ``_batch_ik_collision_solver_cache``). The *obstacle* geometry
+        # (``_col_obstacle_types``/``obstacle_values``), by contrast,
+        # legitimately differs every call (a different person/scene), so it
+        # is threaded through ``_collision_cost`` as a regular function
+        # argument instead of being baked in here -- this is what lets a
+        # single compiled solver be reused across calls with different
+        # obstacles instead of recompiling (~minutes) every time.
         if collision_setup is not None:
             import jax.numpy as _jnp
 
@@ -4324,7 +4441,7 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             _col_local_center = backend.array(collision_setup['local_center'])
             _col_static_center = backend.array(collision_setup['static_center'])
             _col_radii = collision_setup['radii']
-            _col_obstacles = collision_setup['obstacles']
+            _col_obstacle_types = collision_setup['obstacle_types']
             _col_self_pairs = collision_setup['self_pairs']
             _n_col_spheres = len(_col_radii)
 
@@ -4340,12 +4457,16 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                             + backend.matmul(rotations[ci], _col_local_center[i]))
                 return centers
 
-            def _collision_cost(positions, rotations):
+            def _collision_cost(positions, rotations, obstacle_values):
                 centers = _collision_sphere_centers(positions, rotations)
+                obstacles = [
+                    _obstacle_geometry_from_values(obstacle_type, values)
+                    for obstacle_type, values in zip(
+                        _col_obstacle_types, obstacle_values)]
                 cost = 0.0
                 for i in range(_n_col_spheres):
                     sph = _Sphere(center=centers[i], radius=_col_radii[i])
-                    for obs in _col_obstacles:
+                    for obs in obstacles:
                         dist = _collision_distance(sph, obs, xp=_jnp)
                         cost = cost - _colldist_from_sdf(
                             dist, collision_activation_distance, xp=_jnp
@@ -4409,8 +4530,15 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             rot_err_local = _compute_rot_err_local_gd(target_rot, rot)
             return backend.sqrt(backend.sum((rot_err_local * rot_mask) ** 2))
 
-        def loss_fn(opt_angles, target_pos, target_rot):
-            """Compute weighted pose error with mask constraints."""
+        def loss_fn(opt_angles, target_pos, target_rot, obstacle_values):
+            """Compute weighted pose error with mask constraints.
+
+            ``obstacle_values`` (see ``_pack_obstacle_values``) is a
+            regular argument, not a closed-over constant, precisely so a
+            single compiled ``loss_fn``/``solve_batch`` can be reused
+            across calls with different obstacle positions -- see the
+            module-level ``_pack_obstacle_values`` docstring.
+            """
             # Expand to full angles (including mimic joints)
             full_angles = _expand_to_full_angles(opt_angles)
             pos, rot = forward_kinematics_ee(backend, full_angles, fk_params)
@@ -4434,7 +4562,7 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
             if _collision_cost is not None:
                 positions, rotations = forward_kinematics(backend, full_angles, fk_params)
-                total = total + _collision_cost(positions, rotations)
+                total = total + _collision_cost(positions, rotations, obstacle_values)
 
             return total
 
@@ -4471,8 +4599,14 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             else:
                 return backend.array(True)
 
-        def solve_single(init_opt_angles, target_pos, target_rot):
-            """Solve IK for a single target with early stopping."""
+        def solve_single(init_opt_angles, target_pos, target_rot, obstacle_values):
+            """Solve IK for a single target with early stopping.
+
+            ``obstacle_values`` (see ``_pack_obstacle_values``) is shared
+            across the whole batch (not vmapped over), unlike
+            ``init_opt_angles``/``target_pos``/``target_rot`` -- see the
+            ``in_axes`` passed to ``backend.vmap`` below.
+            """
 
             def cond_fn(state):
                 """Continue if not converged and not at max iterations."""
@@ -4486,7 +4620,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                 opt_angles, iteration, _, _ = state
 
                 # Compute gradient and update
-                loss, grad = loss_and_grad(opt_angles, target_pos, target_rot)
+                loss, grad = loss_and_grad(
+                    opt_angles, target_pos, target_rot, obstacle_values)
                 new_opt_angles = opt_angles - learning_rate * grad
                 new_opt_angles = backend.clip(
                     new_opt_angles, joint_limits_lower, joint_limits_upper
@@ -4519,11 +4654,15 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
             return final_full_angles, success, combined_err
 
-        # Vectorize over batch dimension (only batched args now)
-        batched_solve = backend.vmap(solve_single)
+        # Vectorize over batch dimension. ``obstacle_values`` is shared
+        # across the batch (in_axes=None), not one set of obstacles per
+        # attempt/target.
+        batched_solve = backend.vmap(solve_single, in_axes=(0, 0, 0, None))
 
-        def solve_batch(init_opt_angles, target_positions, target_rotations):
-            return batched_solve(init_opt_angles, target_positions, target_rotations)
+        def solve_batch(init_opt_angles, target_positions, target_rotations,
+                        obstacle_values):
+            return batched_solve(init_opt_angles, target_positions,
+                                target_rotations, obstacle_values)
 
         # JIT compile if supported
         return backend.compile(solve_batch)
@@ -4545,7 +4684,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
               collision_weight=10.0,
               collision_activation_distance=0.05,
               self_collision_weight=None,
-              self_collision_activation_distance=0.02):
+              self_collision_activation_distance=0.02,
+              collision_obstacles=None):
         """Solve batch IK.
 
         Parameters
@@ -4616,6 +4756,26 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         self_collision_activation_distance : float
             Distance (in meters) between collision links at which the
             self-collision penalty starts to activate. Default is 0.02.
+        collision_obstacles : list or None
+            Fresh world-frame obstacles (``skrobot.model.primitives``
+            ``Sphere``/``Box``/``Cylinder``, or ``skrobot.collision``
+            geometry) to use for *this* call instead of the obstacles this
+            solver was created with. Only valid when this solver was
+            created with a non-empty ``collision_obstacles``. Must have the
+            same length and the same primitive type at each position (in
+            order) as the solver's original ``collision_obstacles`` --
+            positions/sizes may differ freely, but the count and type
+            sequence may not. This is what lets one compiled solver be
+            reused (instead of recompiled, which for the JAX backend's
+            collision-avoidance gradient-descent solver can take on the
+            order of a minute or more) across many calls with different
+            obstacles, e.g. one call per detected person in a scene: keep
+            calling ``batch_inverse_kinematics``/this ``solve`` with the
+            *same* ``collision_link_list`` and the *same* obstacle
+            count/types every time (pad any missing obstacle with a
+            harmless placeholder far from everything instead of omitting
+            it) and only the obstacle positions need to change between
+            calls. Default is None (use the solver's original obstacles).
 
         Returns
         -------
@@ -4623,6 +4783,33 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             (solutions, success_flags, combined_errors)
             combined_errors is the sum of position and rotation errors.
         """
+        if collision_obstacles is not None:
+            if collision_setup is None:
+                raise ValueError(
+                    "solve() was given collision_obstacles, but this "
+                    "solver was created without collision_link_list / "
+                    "collision_obstacles; collision avoidance cannot be "
+                    "enabled after creation.")
+            from skrobot.collision.robot_collision import primitive_obstacle_to_geometry
+
+            obstacle_geoms_for_call = [
+                primitive_obstacle_to_geometry(o) for o in collision_obstacles]
+            new_types = [type(g).__name__ for g in obstacle_geoms_for_call]
+            if new_types != collision_setup['obstacle_types']:
+                raise ValueError(
+                    "solve()'s collision_obstacles must have the same "
+                    "length and primitive types (in order) as the "
+                    "collision_obstacles this solver was created with, so "
+                    "the compiled solver can be reused; got types {!r}, "
+                    "expected {!r}. Pad missing obstacles with a harmless "
+                    "far-away placeholder of the same primitive type "
+                    "instead of omitting them if the count varies between "
+                    "calls.".format(new_types, collision_setup['obstacle_types']))
+            obstacle_values = _pack_obstacle_values(
+                obstacle_geoms_for_call, backend)
+        else:
+            obstacle_values = default_obstacle_values
+
         target_positions = backend.array(np.asarray(target_positions, dtype=np.float64))
         target_rotations = backend.array(np.asarray(target_rotations, dtype=np.float64))
         n_targets = target_positions.shape[0]
@@ -4718,9 +4905,16 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
         solver_fn = _jit_cache[cache_key]
 
-        # Solve all (targets × attempts)
+        # Solve all (targets × attempts). ``obstacle_values`` is resolved
+        # above from this call's ``collision_obstacles`` (or the solver's
+        # original obstacles); it is not part of ``cache_key`` since
+        # ``solver_fn`` accepts it as a normal argument rather than baking
+        # it in, so the same compiled ``solver_fn`` is reused regardless of
+        # which obstacle values are passed here (see ``solve``'s
+        # ``collision_obstacles`` parameter).
         all_solutions, all_success, all_errors = solver_fn(
-            initial_opt_angles, target_positions_for_solve, target_rotations_for_solve
+            initial_opt_angles, target_positions_for_solve,
+            target_rotations_for_solve, obstacle_values
         )
 
         # If multiple attempts, select best solution for each target

@@ -4084,10 +4084,23 @@ class RobotModel(CascadedLink):
 
         # Create or retrieve cached backend solver. When use_base attaches
         # a virtual chain, the fresh Link/Joint objects give unique id()s
-        # every call, so caching would accumulate stale entries without
-        # ever hitting. Bypass the cache in that case, and also when
-        # collision avoidance is active, since the obstacle geometry is
-        # baked into the compiled solver at creation time.
+        # every call, so the plain identity-based cache key below would
+        # never hit -- bypass it in that case, and also when collision
+        # avoidance is active, where a plain identity key isn't safe:
+        # ``create_batch_ik_solver`` used to bake the obstacle geometry
+        # *values* into the compiled solver at creation time, so blindly
+        # reusing a cached solver across calls with different obstacles
+        # would silently keep applying the first call's (wrong/stale)
+        # obstacles. ``create_batch_ik_solver``'s returned ``solve()`` now
+        # accepts a ``collision_obstacles`` override per call instead (see
+        # its docstring), so a solver can be safely cached and reused here
+        # as long as the *shape* that was compiled into it -- the acting
+        # link chain, the collision link list, and the obstacle
+        # count/primitive-type sequence -- stays the same; only the
+        # obstacle values are allowed to change between calls. This cache
+        # is separate from ``_batch_ik_solver_cache`` above so a mistake
+        # here can't affect the (already well-exercised) plain caching
+        # path.
         if _base_state is None and not wants_collision_avoidance:
             cache_key = (
                 tuple(id(link) for link in single_link_list),
@@ -4103,14 +4116,48 @@ class RobotModel(CascadedLink):
                         backend_name=backend)
             solver = self._batch_ik_solver_cache[cache_key]
         elif wants_collision_avoidance:
-            solver = create_batch_ik_solver(
-                self, single_link_list, single_move_target,
-                backend_name=backend, method='gradient_descent',
-                collision_link_list=collision_link_list,
-                collision_obstacles=collision_obstacles,
-                self_collision=self_collision,
-                n_spheres_per_link=n_spheres_per_link,
-                ignore_adjacent_self_collision=ignore_adjacent_self_collision)
+            # The virtual-chain links closest to the root (if any) are
+            # freshly created every call (see
+            # ``_attach_batch_virtual_base_chain``); only the links after
+            # them are the caller's own, stable objects. Key on those plus
+            # the resolved (min_angle, max_angle) of each virtual joint
+            # (the actual numbers baked into this call's FK, since
+            # ``base_limits`` itself isn't threaded down to here) instead
+            # of the virtual links' own (ever-changing) identity.
+            n_virtual_dof = (
+                _base_state['n_dof'] if _base_state is not None else 0)
+            stable_link_list = single_link_list[n_virtual_dof:]
+            base_joint_limits_sig = (
+                tuple((j.min_angle, j.max_angle)
+                      for j in _base_state['chain_joints'])
+                if _base_state is not None else None)
+            obstacle_type_sig = tuple(
+                type(o).__name__ for o in (collision_obstacles or ()))
+            collision_cache_key = (
+                tuple(id(link) for link in stable_link_list),
+                id(single_move_target),
+                backend,
+                _base_state['use_base'] if _base_state is not None else None,
+                base_joint_limits_sig,
+                tuple(id(link) for link in collision_link_list),
+                obstacle_type_sig,
+                self_collision,
+                n_spheres_per_link,
+                ignore_adjacent_self_collision,
+            )
+            if not hasattr(self, '_batch_ik_collision_solver_cache'):
+                self._batch_ik_collision_solver_cache = {}
+            if collision_cache_key not in self._batch_ik_collision_solver_cache:
+                self._batch_ik_collision_solver_cache[collision_cache_key] = \
+                    create_batch_ik_solver(
+                        self, single_link_list, single_move_target,
+                        backend_name=backend, method='gradient_descent',
+                        collision_link_list=collision_link_list,
+                        collision_obstacles=collision_obstacles,
+                        self_collision=self_collision,
+                        n_spheres_per_link=n_spheres_per_link,
+                        ignore_adjacent_self_collision=ignore_adjacent_self_collision)
+            solver = self._batch_ik_collision_solver_cache[collision_cache_key]
         else:
             solver = create_batch_ik_solver(
                 self, single_link_list, single_move_target,
@@ -4135,6 +4182,14 @@ class RobotModel(CascadedLink):
             solver_kwargs['self_collision_activation_distance'] = \
                 self_collision_margin
             solver_kwargs['learning_rate'] = collision_learning_rate
+            # Always pass this call's obstacles explicitly (rather than
+            # relying on the solver's construction-time obstacles): when
+            # ``solver`` came from ``_batch_ik_collision_solver_cache`` it
+            # may have been created by an earlier call with different
+            # obstacles (e.g. a different person), and ``solve()`` bakes
+            # in nothing obstacle-related at reuse time -- see its
+            # ``collision_obstacles`` parameter.
+            solver_kwargs['collision_obstacles'] = collision_obstacles
         else:
             solver_kwargs['damping'] = 0.01
 
