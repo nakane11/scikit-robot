@@ -802,12 +802,21 @@ class JaxlsSolver(BaseSolver):
         )
 
     def _make_world_collision_cost(self, problem, TrajectoryVar, fk_data, spec):
-        """Create world collision avoidance cost."""
+        """Create world collision avoidance cost.
+
+        Supports two obstacle types (``obstacle['type']``): ``'sphere'``
+        (unchanged) and ``'cylinder'`` (finite flat-capped cylinder --
+        matches ``skrobot.model.primitives.Cylinder``, the shape
+        ``aero_demo.solve_palm_ik.human_body_obstacles`` builds around a
+        skeleton, so callers can pass that geometry directly instead of
+        approximating it with a handful of spheres).
+        """
         import jax.numpy as jnp
         import jaxls
 
         from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions
         from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals
+        from skrobot.planner.trajectory_optimization.fk_utils import compute_cylinder_obstacle_distances
         from skrobot.planner.trajectory_optimization.fk_utils import compute_sphere_obstacle_distances
 
         T = problem.n_waypoints
@@ -816,11 +825,10 @@ class JaxlsSolver(BaseSolver):
         weight = jnp.sqrt(spec.weight)
 
         # Parse obstacles
-        sphere_obs = [
-            obs for obs in obstacles if obs['type'] == 'sphere'
-        ]
+        sphere_obs = [obs for obs in obstacles if obs['type'] == 'sphere']
+        cylinder_obs = [obs for obs in obstacles if obs['type'] == 'cylinder']
 
-        if not sphere_obs:
+        if not sphere_obs and not cylinder_obs:
             # No obstacles, return dummy cost
             @jaxls.Cost.factory(name='world_collision_dummy')
             def dummy_cost(vals, var):
@@ -828,25 +836,42 @@ class JaxlsSolver(BaseSolver):
 
             return dummy_cost(TrajectoryVar(jnp.array([0])))
 
-        obs_centers = jnp.stack([jnp.array(o['center']) for o in sphere_obs])
-        obs_radii = jnp.array([o['radius'] for o in sphere_obs])
         sphere_radii = fk_data['sphere_radii']
-
         _, get_sphere_positions, _, _ = build_fk_functions(fk_data, jnp)
+
+        if sphere_obs:
+            obs_centers = jnp.stack(
+                [jnp.array(o['center']) for o in sphere_obs])
+            obs_radii = jnp.array([o['radius'] for o in sphere_obs])
+        if cylinder_obs:
+            cyl_centers = jnp.stack(
+                [jnp.array(o['center']) for o in cylinder_obs])
+            cyl_rotations = jnp.stack(
+                [jnp.array(o['rotation']) for o in cylinder_obs])
+            cyl_radii = jnp.array([o['radius'] for o in cylinder_obs])
+            cyl_half_heights = jnp.array(
+                [o['half_height'] for o in cylinder_obs])
 
         @jaxls.Cost.factory(name='world_collision')
         def world_collision_cost(vals, var):
             angles = vals[var]
             sphere_pos = get_sphere_positions(angles)
 
-            # Use helper functions for distance computation
-            signed_dists = compute_sphere_obstacle_distances(
-                sphere_pos, sphere_radii, obs_centers, obs_radii, jnp
-            )
-            residuals = compute_collision_residuals(
-                signed_dists, activation_dist, jnp
-            )
-            return (weight * residuals).flatten()
+            residual_parts = []
+            if sphere_obs:
+                signed_dists = compute_sphere_obstacle_distances(
+                    sphere_pos, sphere_radii, obs_centers, obs_radii, jnp
+                )
+                residual_parts.append(compute_collision_residuals(
+                    signed_dists, activation_dist, jnp).flatten())
+            if cylinder_obs:
+                signed_dists = compute_cylinder_obstacle_distances(
+                    sphere_pos, sphere_radii, cyl_centers, cyl_rotations,
+                    cyl_radii, cyl_half_heights, jnp
+                )
+                residual_parts.append(compute_collision_residuals(
+                    signed_dists, activation_dist, jnp).flatten())
+            return weight * jnp.concatenate(residual_parts)
 
         return world_collision_cost(TrajectoryVar(jnp.arange(T)))
 

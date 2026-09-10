@@ -202,6 +202,81 @@ def compute_sphere_obstacle_distances(sphere_positions, sphere_radii,
     return signed_dists
 
 
+def compute_cylinder_obstacle_distances(sphere_positions, sphere_radii,
+                                         obstacle_centers,
+                                         obstacle_rotations,
+                                         obstacle_radii,
+                                         obstacle_half_heights,
+                                         backend):
+    """Compute signed distances between collision spheres and cylinders.
+
+    Each obstacle is a finite (flat-capped) cylinder, matching the
+    ``skrobot.model.primitives.Cylinder`` objects
+    ``aero_demo.solve_palm_ik.human_body_obstacles`` builds around the
+    skeleton (as opposed to approximating each one with a handful of
+    spheres swept along its axis, which leaves gaps between spheres and
+    under-estimates penetration -- see ``aero_demo/scripts/plan_
+    handshake_motion.py`` for the caller that builds ``obstacle_*``
+    directly from that same capsule geometry).
+
+    Unlike :func:`aero_demo`'s (unused, non-differentiable)
+    ``point_to_cylinder_distance``, this returns a true *signed*
+    distance that stays negative (and keeps a non-zero gradient) for a
+    sphere centre anywhere inside the cylinder, not just at its
+    surface -- required so that gradient-based optimisers still get a
+    push-out direction when a waypoint starts out penetrating.
+
+    Parameters
+    ----------
+    sphere_positions : array
+        Collision sphere positions, world frame (n_spheres, 3).
+    sphere_radii : array
+        Collision sphere radii (n_spheres,).
+    obstacle_centers : array
+        Cylinder centre (mid-axis point), world frame (n_obstacles, 3).
+    obstacle_rotations : array
+        Cylinder orientation, local->world rotation matrices with the
+        local +Z axis along the cylinder axis (n_obstacles, 3, 3).
+    obstacle_radii : array
+        Cylinder radii (n_obstacles,).
+    obstacle_half_heights : array
+        Half of each cylinder's height along its axis (n_obstacles,).
+    backend : module
+        Array module.
+
+    Returns
+    -------
+    array
+        Signed distances (n_spheres, n_obstacles).
+        Positive = separated, negative = penetrating.
+    """
+    xp = backend
+    diff = sphere_positions[:, None, :] - obstacle_centers[None, :, :]
+    # local[s, o, :] = obstacle_rotations[o].T @ diff[s, o, :]
+    local = xp.einsum('oji,soj->soi', obstacle_rotations, diff)
+
+    xy_dist = xp.sqrt(local[..., 0] ** 2 + local[..., 1] ** 2 + 1e-10)
+    z_abs = xp.abs(local[..., 2])
+    radius = obstacle_radii[None, :]
+    half_height = obstacle_half_heights[None, :]
+
+    inside_radius = xy_dist <= radius
+    inside_height = z_abs <= half_height
+
+    side_dist = xy_dist - radius
+    cap_dist = z_abs - half_height
+    corner_dist = xp.sqrt(
+        xp.maximum(xy_dist - radius, 0.0) ** 2
+        + xp.maximum(z_abs - half_height, 0.0) ** 2 + 1e-10)
+    interior_dist = -xp.minimum(radius - xy_dist, half_height - z_abs)
+
+    surface_dist = xp.where(
+        inside_radius & inside_height, interior_dist,
+        xp.where(inside_radius, cap_dist,
+                xp.where(inside_height, side_dist, corner_dist)))
+    return surface_dist - sphere_radii[:, None]
+
+
 def compute_self_collision_distances(sphere_positions, sphere_radii,
                                      pairs_i, pairs_j, backend):
     """Compute signed distances for self-collision pairs.
@@ -416,6 +491,7 @@ __all__ = [
     'rotation_error_log',
     'pose_error_log',
     'compute_sphere_obstacle_distances',
+    'compute_cylinder_obstacle_distances',
     'compute_self_collision_distances',
     'compute_collision_residuals',
     'prepare_fk_data',
