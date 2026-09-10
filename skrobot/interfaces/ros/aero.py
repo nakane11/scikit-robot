@@ -23,7 +23,8 @@ class AeroROSRobotInterface(ROSRobotMoveBaseInterface):
                          'l_elbow_joint',
                          'l_wrist_y_joint',
                          'l_wrist_p_joint',
-                         'l_wrist_r_joint'])
+                         'l_wrist_r_joint',
+                         'l_hand_y_joint'])
 
     @property
     def rarm_controller(self):
@@ -38,7 +39,8 @@ class AeroROSRobotInterface(ROSRobotMoveBaseInterface):
                          'r_elbow_joint',
                          'r_wrist_y_joint',
                          'r_wrist_p_joint',
-                         'r_wrist_r_joint'])
+                         'r_wrist_r_joint',
+                         'r_hand_y_joint'])
 
     @property
     def head_controller(self):
