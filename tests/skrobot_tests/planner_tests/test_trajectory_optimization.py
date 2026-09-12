@@ -9,10 +9,16 @@ os.environ.setdefault('JAX_PLATFORMS', 'cpu')
 
 import skrobot  # noqa: E402
 from skrobot.planner.trajectory_optimization.collision import create_self_collision_pairs  # noqa: E402
+from skrobot.planner.trajectory_optimization.collision import point_to_box_distance  # noqa: E402
+from skrobot.planner.trajectory_optimization.collision import point_to_cylinder_distance  # noqa: E402
 from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions  # noqa: E402
+from skrobot.planner.trajectory_optimization.fk_utils import closest_point_on_box  # noqa: E402
+from skrobot.planner.trajectory_optimization.fk_utils import closest_point_on_cylinder  # noqa: E402
+from skrobot.planner.trajectory_optimization.fk_utils import closest_point_on_sphere  # noqa: E402
 from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals  # noqa: E402
 from skrobot.planner.trajectory_optimization.fk_utils import compute_sphere_obstacle_distances  # noqa: E402
 from skrobot.planner.trajectory_optimization.fk_utils import prepare_fk_data  # noqa: E402
+from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance  # noqa: E402
 from skrobot.planner.trajectory_optimization.fk_utils import rotation_error_vector  # noqa: E402
 from skrobot.planner.trajectory_optimization.problem import TrajectoryProblem  # noqa: E402
 from skrobot.planner.trajectory_optimization.trajectory import interpolate_trajectory  # noqa: E402
@@ -148,6 +154,115 @@ class TestCollisionUtils(unittest.TestCase):
         # max(0, 0.05 - (-0.05)) = 0.1
         expected = np.array([0.0, 0.02, 0.1])
         testing.assert_almost_equal(residuals, expected)
+
+
+class TestPrimitiveDistances(unittest.TestCase):
+    """Batched, branch-free primitive distances (fk_utils) against the
+    reference (non-batched, Python-branching) implementations in
+    collision.py, plus the alternating-projection primitive-pair
+    distance used for self/world collision costs."""
+
+    def test_box_matches_reference_outside(self):
+        center = np.zeros(3)
+        rotation = np.eye(3)
+        half_extents = np.array([1.0, 1.0, 1.0])
+        points = np.array([
+            [3.0, 0.0, 0.0],   # outside one face
+            [2.0, 2.0, 0.0],   # outside an edge
+            [2.0, 2.0, 2.0],   # outside a corner
+        ])
+        dist, closest = closest_point_on_box(
+            points, center, rotation, half_extents, np)
+        for i, p in enumerate(points):
+            expected = point_to_box_distance(p, center, rotation, half_extents)
+            self.assertAlmostEqual(float(dist[i]), expected, places=6)
+        # (3,0,0) -> nearest face point is (1,0,0)
+        testing.assert_almost_equal(closest[0], [1.0, 0.0, 0.0])
+
+    def test_box_inside_is_negative_and_signed(self):
+        center = np.zeros(3)
+        rotation = np.eye(3)
+        half_extents = np.array([1.0, 1.0, 1.0])
+        # Closest face is +x (slack 0.5) vs +y/+z (slack 1.0 each).
+        point = np.array([0.5, 0.0, 0.0])
+        dist, closest = closest_point_on_box(
+            point, center, rotation, half_extents, np)
+        self.assertAlmostEqual(float(dist), -0.5, places=6)
+        testing.assert_almost_equal(closest, [1.0, 0.0, 0.0])
+
+    def test_cylinder_matches_reference(self):
+        center = np.zeros(3)
+        rotation = np.eye(3)
+        radius = 1.0
+        half_height = 1.0
+        points = np.array([
+            [2.0, 0.0, 0.0],   # side
+            [0.0, 0.0, 2.0],   # cap
+            [2.0, 0.0, 2.0],   # corner
+        ])
+        dist, _ = closest_point_on_cylinder(
+            points, center, rotation, radius, half_height, np)
+        for i, p in enumerate(points):
+            expected = point_to_cylinder_distance(
+                p, center, rotation, radius, half_height)
+            self.assertAlmostEqual(float(dist[i]), expected, places=6)
+
+    def test_cylinder_inside_pushes_to_nearer_side_wall(self):
+        center = np.zeros(3)
+        rotation = np.eye(3)
+        radius = 1.0
+        half_height = 1.0
+        # radial slack 0.5 < axial slack 0.7 -> nearest face is the wall.
+        point = np.array([0.5, 0.0, 0.3])
+        dist, closest = closest_point_on_cylinder(
+            point, center, rotation, radius, half_height, np)
+        self.assertAlmostEqual(float(dist), -0.5, places=6)
+        testing.assert_almost_equal(closest, [1.0, 0.0, 0.3])
+
+    def test_cylinder_inside_pushes_to_nearer_cap(self):
+        center = np.zeros(3)
+        rotation = np.eye(3)
+        radius = 1.0
+        half_height = 1.0
+        # axial slack 0.3 < radial slack 0.8 -> nearest face is the cap.
+        point = np.array([0.2, 0.0, 0.7])
+        dist, closest = closest_point_on_cylinder(
+            point, center, rotation, radius, half_height, np)
+        self.assertAlmostEqual(float(dist), -0.3, places=6)
+        testing.assert_almost_equal(closest, [0.2, 0.0, 1.0])
+
+    def test_sphere_distance(self):
+        center = np.array([1.0, 0.0, 0.0])
+        radius = 0.3
+        point = np.array([1.0, 0.0, 2.0])
+        dist, closest = closest_point_on_sphere(point, center, radius, np)
+        self.assertAlmostEqual(float(dist), 2.0 - 0.3, places=6)
+        testing.assert_almost_equal(closest, [1.0, 0.0, 0.3])
+
+    def test_pair_sphere_vs_sphere(self):
+        prim_a = dict(type='sphere', center=np.array([0.0, 0.0, 0.0]),
+                     radius=0.3)
+        prim_b = dict(type='sphere', center=np.array([2.0, 0.0, 0.0]),
+                     radius=0.3)
+        dist = primitive_pair_signed_distance(prim_a, prim_b, np)
+        self.assertAlmostEqual(float(dist), 2.0 - 0.3 - 0.3, places=6)
+
+    def test_pair_box_vs_cylinder_separated(self):
+        box = dict(type='box', center=np.zeros(3), rotation=np.eye(3),
+                  half_extents=np.array([1.0, 1.0, 1.0]))
+        cyl = dict(type='cylinder', center=np.array([4.0, 0.0, 0.0]),
+                  rotation=np.eye(3), radius=1.0, half_height=1.0)
+        dist = primitive_pair_signed_distance(box, cyl, np)
+        # Box face at x=1, cylinder's near side at x=4-1=3 -> gap 2.0.
+        self.assertAlmostEqual(float(dist), 2.0, places=4)
+
+    def test_pair_box_vs_cylinder_overlapping_is_negative(self):
+        box = dict(type='box', center=np.zeros(3), rotation=np.eye(3),
+                  half_extents=np.array([1.0, 1.0, 1.0]))
+        cyl = dict(type='cylinder', center=np.array([1.5, 0.0, 0.0]),
+                  rotation=np.eye(3), radius=1.0, half_height=1.0)
+        dist = primitive_pair_signed_distance(box, cyl, np)
+        self.assertLess(float(dist), 0.0)
 
 
 class TestTrajectoryProblem(unittest.TestCase):
@@ -622,6 +737,54 @@ class TestJaxlsSolver(unittest.TestCase):
 
         self.assertEqual(solver._cache_key, cache_key_after_first)
         self.assertIsNotNone(solver._cached_problem)
+
+    def test_caching_obstacle_paramvar_reuse(self):
+        """Moving world_collision obstacles must not rebuild ls_problem.
+
+        Obstacle center/radius/rotation are frozen ParamVars (see
+        JaxlsSolver._make_world_collision_cost), so as long as the
+        obstacle counts per type stay the same, changing only their
+        positions should reuse the compiled problem (same object
+        identity, same cache key) instead of retracing/recompiling.
+        """
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import JaxlsSolver
+
+        def make_problem(cyl_centers):
+            problem = TrajectoryProblem(
+                self.robot, self.link_list, n_waypoints=5)
+            problem.add_smoothness_cost(weight=1.0)
+            obstacles = [
+                dict(type='cylinder', center=list(c),
+                     rotation=np.eye(3).tolist(),
+                     radius=0.05, half_height=0.1)
+                for c in cyl_centers
+            ]
+            problem.add_collision_cost(self.link_list, obstacles)
+            return problem
+
+        start = np.zeros(self.n_joints)
+        end = np.ones(self.n_joints) * 0.3
+        initial_traj = interpolate_trajectory(start, end, 5)
+
+        solver = JaxlsSolver(max_iterations=10)
+
+        problem1 = make_problem([[1.0, 1.0, 1.0], [1.0, -1.0, 1.0]])
+        solver.solve(problem1, initial_traj)
+        cache_key_after_first = solver._cache_key
+        cached_problem_after_first = solver._cached_problem
+        self.assertIsNotNone(cached_problem_after_first)
+
+        # Same obstacle *count*/type, different positions -- must reuse.
+        problem2 = make_problem([[0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+        solver.solve(problem2, initial_traj)
+
+        self.assertEqual(solver._cache_key, cache_key_after_first)
+        self.assertIs(solver._cached_problem, cached_problem_after_first)
+
+        # Different obstacle *count* -- must invalidate the cache.
+        problem3 = make_problem([[0.5, 0.5, 0.5]])
+        solver.solve(problem3, initial_traj)
+        self.assertNotEqual(solver._cache_key, cache_key_after_first)
 
     def test_five_point_velocity_cost(self):
         from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import JaxlsSolver

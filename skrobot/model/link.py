@@ -27,6 +27,11 @@ class Link(CascadedCoords):
             inertia_tensor = np.eye(3)
         self.inertia_tensor = inertia_tensor
         self._collision_mesh = collision_mesh
+        # Exact box/cylinder/sphere params (link-local frame) when this
+        # link's collision geometry is a single primitive; set by
+        # RobotModel.load_urdf_file, None otherwise (mesh geometry,
+        # no collision, or more than one collision element).
+        self.collision_primitive = None
         self.visual_mesh = visual_mesh
         if visual_mesh is not None:
             trimesh = _lazy_trimesh()

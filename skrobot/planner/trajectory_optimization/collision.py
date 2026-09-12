@@ -181,6 +181,74 @@ def extract_collision_spheres(robot_model, link_list, n_spheres_per_link=3):
     }
 
 
+def _bounding_sphere_primitive(link):
+    """Fallback primitive for a link whose collision geometry couldn't be
+    resolved to a single exact box/cylinder/sphere (``link.
+    collision_primitive`` is ``None`` -- more than one ``<collision>``
+    element, or mesh geometry that was never converted to a primitive):
+    a single sphere bounding ``link.collision_mesh``'s vertices around
+    their centroid, in the link's local frame.
+
+    Not exact (this is the same kind of conservative over-approximation
+    ``extract_collision_spheres`` made for every link), but keeps every
+    collision link representable by exactly one convex primitive so
+    :func:`extract_collision_primitives`'s callers don't need a separate
+    code path for it.
+    """
+    mesh = getattr(link, 'collision_mesh', None)
+    if mesh is None:
+        return None
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    center = verts.mean(axis=0)
+    radius = float(np.linalg.norm(verts - center, axis=1).max())
+    return {'type': 'sphere', 'center': center, 'radius': radius}
+
+
+def extract_collision_primitives(link_list):
+    """Exact box/cylinder/sphere primitive (link-local frame) for each
+    link in ``link_list``.
+
+    Unlike :func:`extract_collision_spheres` (which approximates every
+    link with several spheres along its bounding capsule, regardless of
+    its actual shape), this reads the exact primitive
+    ``apply_collision_model``
+    (``aero_demo/scripts/solve_palm_ik.py``) assigned to the link's
+    ``collision_mesh`` via ``skrobot.urdf.convert_meshes_to_primitives``
+    -- preserved losslessly on ``link.collision_primitive`` by
+    ``RobotModel.load_urdf_file`` (see
+    ``RobotModel._collision_primitive_from_urdf_link``), not re-fit from
+    the triangulated mesh. This is what lets the optimisation cost, the
+    post-hoc ``collision_pairs_min_distance`` verification and the
+    viewer all agree on the same one-shape-per-link geometry.
+
+    Falls back to a bounding sphere (see :func:`_bounding_sphere_primitive`)
+    for a link whose collision geometry isn't a single primitive, so
+    every entry is still exactly one convex shape; ``None`` for a link
+    with no collision geometry at all.
+
+    Parameters
+    ----------
+    link_list : list
+        Links to extract primitives for (typically
+        ``collision_link_list_for_arm``'s output).
+
+    Returns
+    -------
+    list of (dict or None)
+        One entry per link, in ``link_list`` order. Each dict is
+        ``{'type': 'box', 'center', 'rotation', 'half_extents'}``,
+        ``{'type': 'cylinder', 'center', 'rotation', 'radius',
+        'half_height'}`` or ``{'type': 'sphere', 'center', 'radius'}``.
+    """
+    primitives = []
+    for link in link_list:
+        prim = getattr(link, 'collision_primitive', None)
+        if prim is None:
+            prim = _bounding_sphere_primitive(link)
+        primitives.append(prim)
+    return primitives
+
+
 def create_self_collision_pairs(link_list, ignore_adjacent=True):
     """Create pairs of links for self-collision checking.
 

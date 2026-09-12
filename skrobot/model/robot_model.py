@@ -2982,6 +2982,42 @@ class RobotModel(CascadedLink):
             meshes.extend(self._meshes_from_urdf_visual(visual))
         return meshes
 
+    def _collision_primitive_from_urdf_link(self, urdf_link):
+        """Exact box/cylinder/sphere params (link-local frame) for a link
+        whose collision geometry is a single primitive, or None (mesh
+        geometry, no collision element, or more than one collision
+        element -- callers fall back to ``link.collision_mesh`` then).
+        """
+        collisions = urdf_link.collisions
+        if len(collisions) != 1:
+            return None
+        geometry = collisions[0].geometry.geometry
+        origin = collisions[0].origin
+        center = origin[:3, 3].copy()
+        rotation = origin[:3, :3].copy()
+        if isinstance(geometry, urdf.Box):
+            return {
+                'type': 'box',
+                'center': center,
+                'rotation': rotation,
+                'half_extents': geometry.size / 2.0,
+            }
+        elif isinstance(geometry, urdf.Cylinder):
+            return {
+                'type': 'cylinder',
+                'center': center,
+                'rotation': rotation,
+                'radius': geometry.radius,
+                'half_height': geometry.length / 2.0,
+            }
+        elif isinstance(geometry, urdf.Sphere):
+            return {
+                'type': 'sphere',
+                'center': center,
+                'radius': geometry.radius,
+            }
+        return None
+
     def _meshes_from_urdf_visual(self, visual):
         if not isinstance(visual, urdf.Visual):
             raise TypeError('visual must be urdf.Visual, but got: {}'
@@ -3332,6 +3368,8 @@ class RobotModel(CascadedLink):
         for urdf_link in self.urdf_robot_model.links:
             link = Link(name=urdf_link.name)
             link.collision_mesh = urdf_link.collision_mesh
+            link.collision_primitive = self._collision_primitive_from_urdf_link(
+                urdf_link)
             link.visual_mesh = self._meshes_from_urdf_visuals(
                 urdf_link.visuals)
             links.append(link)

@@ -165,10 +165,15 @@ class JaxlsSolver(BaseSolver):
         self._cached_cartesian_rot_param_var = None
         self._cached_ee_wp_pos_param_var = None
         self._cached_ee_wp_rot_param_var = None
+        self._cached_sphere_obs_param_var = None
+        self._cached_cyl_geom_param_var = None
+        self._cached_cyl_rotation_param_var = None
         self._cached_constraint_ids = None
         self._cached_has_cartesian = False
         self._cached_has_cart_rot = False
         self._cached_has_ee_waypoints = False
+        self._cached_has_sphere_obs = False
+        self._cached_has_cyl_obs = False
         self._cache_key = None
 
     def _make_cache_key(self, problem):
@@ -208,16 +213,23 @@ class JaxlsSolver(BaseSolver):
             for c in problem.ee_waypoint_costs
         )
 
-        # Include obstacle positions in cache key
-        # (obstacles change position, so compiled problem must be invalidated)
-        obstacle_key = tuple()
+        # Obstacle *structure* only (counts per type), NOT their
+        # positions/radii/rotations -- those are passed to the cost as
+        # frozen ParamVars (see solve()/_make_world_collision_cost) so
+        # the compiled problem can be reused as obstacles move. This
+        # relies on the Nth sphere/cylinder in ``obstacles`` referring to
+        # the same logical obstacle across calls (true for aero_demo's
+        # fixed-slot human-body obstacle list, which pads missing body
+        # parts with dummies instead of shrinking the list).
+        obstacle_key = (0, 0)
         for r in problem.residuals:
             if r.name == 'world_collision':
                 obstacles = r.params.get('obstacles', [])
-                obstacle_key = tuple(
-                    (tuple(o['center']), o['radius'])
-                    for o in obstacles
-                )
+                n_sphere_obs = sum(
+                    1 for o in obstacles if o['type'] == 'sphere')
+                n_cyl_obs = sum(
+                    1 for o in obstacles if o['type'] == 'cylinder')
+                obstacle_key = (n_sphere_obs, n_cyl_obs)
                 break
 
         key = (
@@ -232,7 +244,7 @@ class JaxlsSolver(BaseSolver):
             wp_constraint_indices,
             has_cart_rot,
             ee_wp_key,
-            obstacle_key,  # Include obstacle positions
+            obstacle_key,  # (n_sphere_obs, n_cyl_obs) -- structure only
         )
         return key
 
@@ -282,11 +294,33 @@ class JaxlsSolver(BaseSolver):
             CartesianRotParamVar = self._cached_cartesian_rot_param_var
             EEWpPosParamVar = self._cached_ee_wp_pos_param_var
             EEWpRotParamVar = self._cached_ee_wp_rot_param_var
+            SphereObsParamVar = self._cached_sphere_obs_param_var
+            CylGeomParamVar = self._cached_cyl_geom_param_var
+            CylRotationParamVar = self._cached_cyl_rotation_param_var
             constraint_ids = self._cached_constraint_ids
             has_cartesian = self._cached_has_cartesian
             has_cart_rot = self._cached_has_cart_rot
             has_ee_waypoints = self._cached_has_ee_waypoints
+            has_sphere_obs = self._cached_has_sphere_obs
+            has_cyl_obs = self._cached_has_cyl_obs
         else:
+            # Pre-scan world_collision obstacle counts so the frozen
+            # ParamVar classes below can be sized correctly (each one
+            # holds *all* obstacles of a type flattened into a single
+            # batch-of-1 instance -- see the comment further down).
+            n_sphere_obs = 0
+            n_cyl_obs = 0
+            for r in problem.residuals:
+                if r.name == 'world_collision':
+                    _obs = r.params.get('obstacles', [])
+                    n_sphere_obs = sum(
+                        1 for o in _obs if o['type'] == 'sphere')
+                    n_cyl_obs = sum(
+                        1 for o in _obs if o['type'] == 'cylinder')
+                    break
+            has_sphere_obs = n_sphere_obs > 0
+            has_cyl_obs = n_cyl_obs > 0
+
             default_cfg = jnp.zeros(n_total_dof)
             default_pos = jnp.zeros(3)
             default_rot = jnp.zeros(9)
@@ -339,6 +373,50 @@ class JaxlsSolver(BaseSolver):
             ):
                 pass
 
+            # World-collision obstacle geometry as a single frozen
+            # ParamVar *instance* per attribute (id=[0], batch size 1),
+            # holding every obstacle of that type flattened into one
+            # value. jaxls broadcasts a batch-of-1 Var's id against the
+            # TrajectoryVar's batch of T (see jaxls.Cost docstring: "
+            # Leading axes of shape (1,) are broadcasted"), so the same
+            # obstacle geometry is shared across all T waypoints instead
+            # of being paired index-for-index with them (which is what
+            # a batch-of-N-obstacles Var would do, and N != T in
+            # general). This lets obstacles move between solves without
+            # invalidating the compiled problem, as long as the obstacle
+            # counts per type stay the same (see _make_cache_key).
+            # Sphere: N_sphere * [cx, cy, cz, radius] flattened. Cylinder
+            # geometry: N_cyl * [cx, cy, cz, radius, half_height]
+            # flattened; cylinder rotations (N_cyl * flattened 3x3) are
+            # kept in a separate Var, like Cartesian/EE rotations above.
+            default_sphere_obs = jnp.zeros(n_sphere_obs * 4)
+            default_cyl_geom = jnp.zeros(n_cyl_obs * 5)
+            default_cyl_rot = jnp.zeros(n_cyl_obs * 9)
+
+            class SphereObsParamVar(
+                jaxls.Var[jnp.ndarray],
+                default_factory=lambda: default_sphere_obs,
+                retract_fn=lambda x, delta: x,
+                tangent_dim=0,
+            ):
+                pass
+
+            class CylGeomParamVar(
+                jaxls.Var[jnp.ndarray],
+                default_factory=lambda: default_cyl_geom,
+                retract_fn=lambda x, delta: x,
+                tangent_dim=0,
+            ):
+                pass
+
+            class CylRotationParamVar(
+                jaxls.Var[jnp.ndarray],
+                default_factory=lambda: default_cyl_rot,
+                retract_fn=lambda x, delta: x,
+                tangent_dim=0,
+            ):
+                pass
+
             traj_vars = TrajectoryVar(jnp.arange(T))
 
             # Prepare FK data
@@ -362,7 +440,10 @@ class JaxlsSolver(BaseSolver):
                     ))
                 elif residual_spec.name == 'world_collision':
                     costs.append(self._make_world_collision_cost(
-                        problem, TrajectoryVar, fk_data, residual_spec
+                        problem, TrajectoryVar,
+                        SphereObsParamVar, CylGeomParamVar,
+                        CylRotationParamVar,
+                        fk_data, residual_spec,
                     ))
                 elif residual_spec.name == 'self_collision':
                     costs.append(self._make_self_collision_cost(
@@ -536,6 +617,11 @@ class JaxlsSolver(BaseSolver):
                 all_variables.append(
                     EEWpRotParamVar(jnp.arange(n_ee_wps))
                 )
+            if has_sphere_obs:
+                all_variables.append(SphereObsParamVar(jnp.array([0])))
+            if has_cyl_obs:
+                all_variables.append(CylGeomParamVar(jnp.array([0])))
+                all_variables.append(CylRotationParamVar(jnp.array([0])))
 
             # CoG cost ParamVars (one per add_com_cost call). The cost
             # factory stashes them on ``problem._com_param_vars``.
@@ -570,10 +656,15 @@ class JaxlsSolver(BaseSolver):
             self._cached_cartesian_rot_param_var = CartesianRotParamVar
             self._cached_ee_wp_pos_param_var = EEWpPosParamVar
             self._cached_ee_wp_rot_param_var = EEWpRotParamVar
+            self._cached_sphere_obs_param_var = SphereObsParamVar
+            self._cached_cyl_geom_param_var = CylGeomParamVar
+            self._cached_cyl_rotation_param_var = CylRotationParamVar
             self._cached_constraint_ids = constraint_ids
             self._cached_has_cartesian = has_cartesian
             self._cached_has_cart_rot = has_cart_rot
             self._cached_has_ee_waypoints = has_ee_waypoints
+            self._cached_has_sphere_obs = has_sphere_obs
+            self._cached_has_cyl_obs = has_cyl_obs
             self._cache_key = cache_key
 
         # --- Build init_vals with current dynamic values ---
@@ -619,6 +710,49 @@ class JaxlsSolver(BaseSolver):
                     jnp.array(ee_rot_values)
                 )
             )
+
+        # World-collision obstacle ParamVar values (read fresh from the
+        # incoming ``problem`` every call -- even on a cache hit, this
+        # ``problem`` is a new instance whose obstacles may have moved).
+        if has_sphere_obs or has_cyl_obs:
+            for r in problem.residuals:
+                if r.name != 'world_collision':
+                    continue
+                obstacles = r.params.get('obstacles', [])
+                if has_sphere_obs:
+                    sphere_obs = [
+                        o for o in obstacles if o['type'] == 'sphere']
+                    sphere_vals = np.array([
+                        list(o['center']) + [o['radius']]
+                        for o in sphere_obs
+                    ])
+                    init_pairs.append(
+                        SphereObsParamVar(
+                            jnp.arange(len(sphere_obs))
+                        ).with_value(jnp.array(sphere_vals))
+                    )
+                if has_cyl_obs:
+                    cylinder_obs = [
+                        o for o in obstacles if o['type'] == 'cylinder']
+                    cyl_geom_vals = np.array([
+                        list(o['center']) + [o['radius'], o['half_height']]
+                        for o in cylinder_obs
+                    ])
+                    cyl_rot_vals = np.array([
+                        np.asarray(o['rotation']).flatten()
+                        for o in cylinder_obs
+                    ])
+                    init_pairs.append(
+                        CylGeomParamVar(
+                            jnp.arange(len(cylinder_obs))
+                        ).with_value(jnp.array(cyl_geom_vals))
+                    )
+                    init_pairs.append(
+                        CylRotationParamVar(
+                            jnp.arange(len(cylinder_obs))
+                        ).with_value(jnp.array(cyl_rot_vals))
+                    )
+                break
 
         # Cartesian param values
         if has_cartesian:
@@ -801,23 +935,55 @@ class JaxlsSolver(BaseSolver):
             EEWpRotParamVar(jnp.arange(n_ee_wps)),
         )
 
-    def _make_world_collision_cost(self, problem, TrajectoryVar, fk_data, spec):
+    def _make_world_collision_cost(
+        self, problem, TrajectoryVar,
+        SphereObsParamVar, CylGeomParamVar, CylRotationParamVar,
+        fk_data, spec,
+    ):
         """Create world collision avoidance cost.
 
         Supports two obstacle types (``obstacle['type']``): ``'sphere'``
-        (unchanged) and ``'cylinder'`` (finite flat-capped cylinder --
-        matches ``skrobot.model.primitives.Cylinder``, the shape
+        and ``'cylinder'`` (finite flat-capped cylinder -- matches
+        ``skrobot.model.primitives.Cylinder``, the shape
         ``aero_demo.solve_palm_ik.human_body_obstacles`` builds around a
         skeleton, so callers can pass that geometry directly instead of
         approximating it with a handful of spheres).
+
+        The robot side is represented by its exact box/cylinder/sphere
+        collision primitives (``fk_data['collision_primitives']``, built
+        by ``TrajectoryProblem._compute_collision_primitives`` from
+        ``collision.extract_collision_primitives`` -- one primitive per
+        link, matching ``aero_demo.solve_palm_ik.apply_collision_model``,
+        not the old fixed-N-spheres-per-link bounding-capsule
+        approximation). Distances against a robot box/cylinder use
+        :func:`~...fk_utils.primitive_pair_signed_distance`'s alternating
+        projection; against a robot sphere they reduce to the exact
+        point-to-primitive formula (see that function's docstring for
+        the accuracy caveat this implies for box/cylinder-vs-cylinder
+        pairs under deep penetration).
+
+        Obstacle geometry (center/radius/rotation/half_height) is read
+        from frozen ``tangent_dim=0`` ParamVars (``SphereObsParamVar``,
+        ``CylGeomParamVar``, ``CylRotationParamVar``) instead of being
+        baked into the cost closure as Python constants, so the compiled
+        ``ls_problem`` can be reused across solves where only the
+        obstacles move -- as long as the obstacle *counts* per type stay
+        the same (see ``_make_cache_key``). This assumes the Nth sphere/
+        cylinder in ``obstacles`` refers to the same logical obstacle
+        across calls (true for aero_demo's fixed-slot human-body
+        obstacle list; see
+        ``plan_handshake_motion.human_body_cylinder_obstacles``). The
+        robot-side primitive geometry is *not* parametric -- it is fixed
+        for a given robot/collision_link_list, so it is baked into the
+        cost closure like ``sphere_radii`` was before.
         """
         import jax.numpy as jnp
         import jaxls
 
         from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions
         from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals
-        from skrobot.planner.trajectory_optimization.fk_utils import compute_cylinder_obstacle_distances
-        from skrobot.planner.trajectory_optimization.fk_utils import compute_sphere_obstacle_distances
+        from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
+        from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
 
         T = problem.n_waypoints
         obstacles = spec.params['obstacles']
@@ -827,96 +993,202 @@ class JaxlsSolver(BaseSolver):
         # Parse obstacles
         sphere_obs = [obs for obs in obstacles if obs['type'] == 'sphere']
         cylinder_obs = [obs for obs in obstacles if obs['type'] == 'cylinder']
+        robot_buckets = fk_data.get('collision_primitives', {})
 
-        if not sphere_obs and not cylinder_obs:
-            # No obstacles, return dummy cost
+        if (not sphere_obs and not cylinder_obs) or not robot_buckets:
+            # No obstacles, or no robot-side collision geometry at all.
             @jaxls.Cost.factory(name='world_collision_dummy')
             def dummy_cost(vals, var):
                 return jnp.array([0.0])
 
             return dummy_cost(TrajectoryVar(jnp.array([0])))
 
-        sphere_radii = fk_data['sphere_radii']
-        _, get_sphere_positions, _, _ = build_fk_functions(fk_data, jnp)
+        n_sphere = len(sphere_obs)
+        n_cyl = len(cylinder_obs)
+        get_link_transforms, _, _, _ = build_fk_functions(fk_data, jnp)
 
-        if sphere_obs:
-            obs_centers = jnp.stack(
-                [jnp.array(o['center']) for o in sphere_obs])
-            obs_radii = jnp.array([o['radius'] for o in sphere_obs])
-        if cylinder_obs:
-            cyl_centers = jnp.stack(
-                [jnp.array(o['center']) for o in cylinder_obs])
-            cyl_rotations = jnp.stack(
-                [jnp.array(o['rotation']) for o in cylinder_obs])
-            cyl_radii = jnp.array([o['radius'] for o in cylinder_obs])
-            cyl_half_heights = jnp.array(
-                [o['half_height'] for o in cylinder_obs])
+        def _expand(prim, axis):
+            # Add a broadcasting axis to every array value (all but
+            # 'type') so a (n_a,) batch of primitives can be compared
+            # against a (n_b,) batch cross-product-style, without the
+            # (n_a, n_b) grid having to be a Python-level primitive type.
+            return {k: (v if k == 'type' else jnp.expand_dims(v, axis))
+                    for k, v in prim.items()}
 
-        @jaxls.Cost.factory(name='world_collision')
-        def world_collision_cost(vals, var):
-            angles = vals[var]
-            sphere_pos = get_sphere_positions(angles)
+        def _robot_primitive(ptype, link_positions, link_rotations):
+            bucket = robot_buckets[ptype]
+            center, rotation = get_primitive_world_pose(
+                bucket, link_positions, link_rotations, jnp)
+            prim = {'type': ptype, 'center': center}
+            if rotation is not None:
+                prim['rotation'] = rotation
+            if ptype == 'box':
+                prim['half_extents'] = bucket['half_extents']
+            elif ptype == 'cylinder':
+                prim['radius'] = bucket['radius']
+                prim['half_height'] = bucket['half_height']
+            else:
+                prim['radius'] = bucket['radius']
+            return prim
 
-            residual_parts = []
-            if sphere_obs:
-                signed_dists = compute_sphere_obstacle_distances(
-                    sphere_pos, sphere_radii, obs_centers, obs_radii, jnp
-                )
-                residual_parts.append(compute_collision_residuals(
-                    signed_dists, activation_dist, jnp).flatten())
-            if cylinder_obs:
-                signed_dists = compute_cylinder_obstacle_distances(
-                    sphere_pos, sphere_radii, cyl_centers, cyl_rotations,
-                    cyl_radii, cyl_half_heights, jnp
-                )
-                residual_parts.append(compute_collision_residuals(
-                    signed_dists, activation_dist, jnp).flatten())
-            return weight * jnp.concatenate(residual_parts)
+        def _sphere_obstacle_primitive(sphere_geom):
+            return {'type': 'sphere', 'center': sphere_geom[:, :3],
+                   'radius': sphere_geom[:, 3]}
 
-        return world_collision_cost(TrajectoryVar(jnp.arange(T)))
+        def _cylinder_obstacle_primitive(cyl_geom, cyl_rotation_flat):
+            return {
+                'type': 'cylinder',
+                'center': cyl_geom[:, :3],
+                'radius': cyl_geom[:, 3],
+                'half_height': cyl_geom[:, 4],
+                'rotation': cyl_rotation_flat.reshape(n_cyl, 3, 3),
+            }
+
+        def _residual_for(robot_prim, obstacle_prim):
+            dists = primitive_pair_signed_distance(
+                _expand(robot_prim, 1), _expand(obstacle_prim, 0), jnp)
+            return compute_collision_residuals(
+                dists, activation_dist, jnp).flatten()
+
+        def _all_residuals(link_positions, link_rotations, obstacle_prims):
+            parts = [
+                _residual_for(
+                    _robot_primitive(ptype, link_positions, link_rotations),
+                    obstacle_prim)
+                for ptype in robot_buckets
+                for obstacle_prim in obstacle_prims
+            ]
+            return jnp.concatenate(parts)
+
+        if sphere_obs and cylinder_obs:
+            @jaxls.Cost.factory(name='world_collision')
+            def world_collision_cost(
+                vals, var, sphere_param, cyl_geom_param, cyl_rot_param,
+            ):
+                link_positions, link_rotations = get_link_transforms(
+                    vals[var])
+                obstacle_prims = [
+                    _sphere_obstacle_primitive(vals[sphere_param]),
+                    _cylinder_obstacle_primitive(
+                        vals[cyl_geom_param], vals[cyl_rot_param]),
+                ]
+                return weight * _all_residuals(
+                    link_positions, link_rotations, obstacle_prims)
+
+            return world_collision_cost(
+                TrajectoryVar(jnp.arange(T)),
+                SphereObsParamVar(jnp.arange(n_sphere)),
+                CylGeomParamVar(jnp.arange(n_cyl)),
+                CylRotationParamVar(jnp.arange(n_cyl)),
+            )
+        elif sphere_obs:
+            @jaxls.Cost.factory(name='world_collision')
+            def world_collision_cost(vals, var, sphere_param):
+                link_positions, link_rotations = get_link_transforms(
+                    vals[var])
+                obstacle_prims = [_sphere_obstacle_primitive(
+                    vals[sphere_param])]
+                return weight * _all_residuals(
+                    link_positions, link_rotations, obstacle_prims)
+
+            return world_collision_cost(
+                TrajectoryVar(jnp.arange(T)),
+                SphereObsParamVar(jnp.arange(n_sphere)),
+            )
+        else:
+            @jaxls.Cost.factory(name='world_collision')
+            def world_collision_cost(
+                vals, var, cyl_geom_param, cyl_rot_param,
+            ):
+                link_positions, link_rotations = get_link_transforms(
+                    vals[var])
+                obstacle_prims = [_cylinder_obstacle_primitive(
+                    vals[cyl_geom_param], vals[cyl_rot_param])]
+                return weight * _all_residuals(
+                    link_positions, link_rotations, obstacle_prims)
+
+            return world_collision_cost(
+                TrajectoryVar(jnp.arange(T)),
+                CylGeomParamVar(jnp.arange(n_cyl)),
+                CylRotationParamVar(jnp.arange(n_cyl)),
+            )
 
     def _make_self_collision_cost(self, problem, TrajectoryVar, fk_data, spec):
-        """Create self-collision avoidance cost."""
+        """Create self-collision avoidance cost.
+
+        Robot-side geometry is the same exact box/cylinder/sphere
+        collision primitives used by ``_make_world_collision_cost`` (see
+        its docstring), one per link. Self-collision pairs are grouped
+        by (type_a, type_b) primitive combination
+        (``fk_data['self_collision_primitive_pairs']``, built by
+        ``TrajectoryProblem._compute_self_collision_primitive_pairs``)
+        so each group can be evaluated as one batched, aligned (not
+        cross-product) call to
+        :func:`~...fk_utils.primitive_pair_signed_distance` -- row *k*
+        of group (type_a, type_b) is the distance for one specific
+        self-collision link pair, unlike the cross-product used against
+        world obstacles.
+        """
         import jax.numpy as jnp
         import jaxls
 
         from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions
         from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals
-        from skrobot.planner.trajectory_optimization.fk_utils import compute_self_collision_distances
+        from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
+        from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
 
         T = problem.n_waypoints
-        pair_indices = spec.params['pair_indices']
         activation_dist = spec.params['activation_distance']
         weight = jnp.sqrt(spec.weight)
 
-        pairs_i, pairs_j = pair_indices
+        robot_buckets = fk_data.get('collision_primitives', {})
+        pair_groups = {
+            combo: rows for combo, rows in
+            fk_data.get('self_collision_primitive_pairs', {}).items()
+            if rows['rows_a'].shape[0] > 0
+        }
 
-        if len(pairs_i) == 0:
+        if not pair_groups:
             @jaxls.Cost.factory(name='self_collision_dummy')
             def dummy_cost(vals, var):
                 return jnp.array([0.0])
 
             return dummy_cost(TrajectoryVar(jnp.array([0])))
 
-        pairs_i = jnp.array(pairs_i)
-        pairs_j = jnp.array(pairs_j)
-        sphere_radii = fk_data['sphere_radii']
+        get_link_transforms, _, _, _ = build_fk_functions(fk_data, jnp)
 
-        _, get_sphere_positions, _, _ = build_fk_functions(fk_data, jnp)
+        def _primitive_from_rows(ptype, rows, link_positions, link_rotations):
+            sub = {k: v[rows] for k, v in robot_buckets[ptype].items()}
+            center, rotation = get_primitive_world_pose(
+                sub, link_positions, link_rotations, jnp)
+            prim = {'type': ptype, 'center': center}
+            if rotation is not None:
+                prim['rotation'] = rotation
+            if ptype == 'box':
+                prim['half_extents'] = sub['half_extents']
+            elif ptype == 'cylinder':
+                prim['radius'] = sub['radius']
+                prim['half_height'] = sub['half_height']
+            else:
+                prim['radius'] = sub['radius']
+            return prim
 
         @jaxls.Cost.factory(name='self_collision')
         def self_collision_cost(vals, var):
             angles = vals[var]
-            sphere_pos = get_sphere_positions(angles)
+            link_positions, link_rotations = get_link_transforms(angles)
 
-            # Use helper functions for distance computation
-            signed_dists = compute_self_collision_distances(
-                sphere_pos, sphere_radii, pairs_i, pairs_j, jnp
-            )
-            residuals = compute_collision_residuals(
-                signed_dists, activation_dist, jnp
-            )
-            return (weight * residuals).flatten()
+            parts = []
+            for (type_a, type_b), rows in pair_groups.items():
+                prim_a = _primitive_from_rows(
+                    type_a, rows['rows_a'], link_positions, link_rotations)
+                prim_b = _primitive_from_rows(
+                    type_b, rows['rows_b'], link_positions, link_rotations)
+                signed_dists = primitive_pair_signed_distance(
+                    prim_a, prim_b, jnp)
+                parts.append(compute_collision_residuals(
+                    signed_dists, activation_dist, jnp).flatten())
+            return weight * jnp.concatenate(parts)
 
         return self_collision_cost(TrajectoryVar(jnp.arange(T)))
 

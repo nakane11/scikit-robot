@@ -277,6 +277,307 @@ def compute_cylinder_obstacle_distances(sphere_positions, sphere_radii,
     return surface_dist - sphere_radii[:, None]
 
 
+def _safe_norm(x, backend, axis=-1, eps=1e-10):
+    xp = backend
+    return xp.sqrt(xp.sum(x ** 2, axis=axis) + eps)
+
+
+def closest_point_on_box(points, box_centers, box_rotations,
+                         box_half_extents, backend):
+    """Signed distance from point(s) to a box, and the nearest point on
+    the box *surface*.
+
+    Broadcasts over any shared leading batch shape of ``points``,
+    ``box_centers``, ``box_rotations`` and ``box_half_extents``. Matches
+    :func:`skrobot.planner.trajectory_optimization.collision.
+    point_to_box_distance` when a point is outside the box, but (a) is
+    branch-free (``jnp.clip``/``jnp.where`` only) so it works under
+    ``jax.jit``/``jax.grad``, and (b) returns a *signed* distance and a
+    surface point (instead of clamping to 0) when a point is inside the
+    box -- needed so a gradient-based optimiser still gets a push-out
+    direction for a waypoint that starts out penetrating (mirrors the
+    ``interior_dist`` branch of :func:`compute_cylinder_obstacle_distances`
+    below).
+
+    Parameters
+    ----------
+    points : array, (..., 3)
+        Query points, world frame.
+    box_centers : array, (..., 3)
+        Box centers, world frame.
+    box_rotations : array, (..., 3, 3)
+        Box local->world rotation (columns = box local axes in world).
+    box_half_extents : array, (..., 3)
+    backend : module
+
+    Returns
+    -------
+    signed_dist : array, (...,)
+        Positive outside the box, negative inside (distance to the
+        nearest face).
+    closest_point : array, (..., 3)
+        Nearest point on the box surface, world frame.
+    """
+    xp = backend
+    diff = points - box_centers
+    local = xp.einsum('...ji,...j->...i', box_rotations, diff)
+
+    clipped = xp.clip(local, -box_half_extents, box_half_extents)
+    outside_dist = _safe_norm(local - clipped, xp)
+    is_outside = xp.any(xp.abs(local) > box_half_extents, axis=-1)
+
+    slack = box_half_extents - xp.abs(local)
+    push_axis = xp.argmin(slack, axis=-1)
+    axis_onehot = xp.arange(local.shape[-1]) == push_axis[..., None]
+    sign = xp.where(local >= 0, 1.0, -1.0)
+    interior_point = xp.where(axis_onehot, sign * box_half_extents, local)
+    interior_dist = -xp.min(slack, axis=-1)
+
+    closest_local = xp.where(is_outside[..., None], clipped, interior_point)
+    signed_dist = xp.where(is_outside, outside_dist, interior_dist)
+    closest_world = box_centers + xp.einsum(
+        '...ij,...j->...i', box_rotations, closest_local)
+    return signed_dist, closest_world
+
+
+def closest_point_on_cylinder(points, cyl_centers, cyl_rotations,
+                              cyl_radii, cyl_half_heights, backend):
+    """Signed distance from point(s) to a (flat-capped) cylinder, and the
+    nearest point on the cylinder *surface*.
+
+    Local +Z axis is the cylinder axis, matching
+    :func:`compute_cylinder_obstacle_distances`'s convention. Same
+    branch-free / signed-with-surface-point design as
+    :func:`closest_point_on_box` (see its docstring); the exterior
+    distance formula matches
+    :func:`skrobot.planner.trajectory_optimization.collision.
+    point_to_cylinder_distance`.
+
+    Parameters
+    ----------
+    points : array, (..., 3)
+    cyl_centers : array, (..., 3)
+    cyl_rotations : array, (..., 3, 3)
+    cyl_radii : array, (...,)
+    cyl_half_heights : array, (...,)
+    backend : module
+
+    Returns
+    -------
+    signed_dist : array, (...,)
+    closest_point : array, (..., 3)
+        Nearest point on the cylinder surface, world frame.
+    """
+    xp = backend
+    diff = points - cyl_centers
+    local = xp.einsum('...ji,...j->...i', cyl_rotations, diff)
+    xy = local[..., :2]
+    z = local[..., 2]
+    xy_dist = _safe_norm(xy, xp)
+    z_abs = xp.abs(z)
+
+    # A scalar (single-primitive) radius/half_height is a plain Python
+    # float, not an array -- ``radius[..., None]`` below needs an array
+    # (even 0-d) to be indexable.
+    radius = xp.asarray(cyl_radii)
+    half_height = xp.asarray(cyl_half_heights)
+
+    inside_radius = xy_dist <= radius
+    inside_height = z_abs <= half_height
+
+    # Radial direction; falls back to an arbitrary axis when the point
+    # sits exactly on the cylinder axis (xy_dist ~ 0), where the nearest
+    # side-wall point is undefined anyway.
+    safe_xy_dist = xp.maximum(xy_dist, 1e-8)
+    on_axis = xy_dist < 1e-6
+    fallback_dir = xp.zeros_like(xy)
+    fallback_dir = xp.concatenate(
+        [xp.ones_like(z)[..., None], xp.zeros_like(z)[..., None]], axis=-1)
+    radial_dir = xp.where(
+        on_axis[..., None], fallback_dir, xy / safe_xy_dist[..., None])
+    side_xy = radial_dir * radius[..., None]
+    cap_z = xp.where(z >= 0, half_height, -half_height)
+
+    side_dist = xy_dist - radius
+    cap_dist = z_abs - half_height
+    corner_dist = _safe_norm(
+        xp.concatenate(
+            [xp.maximum(xy_dist - radius, 0.0)[..., None],
+             xp.maximum(z_abs - half_height, 0.0)[..., None]], axis=-1),
+        xp)
+
+    radial_slack = radius - xy_dist
+    axial_slack = half_height - z_abs
+    push_radial = radial_slack < axial_slack
+
+    outside_xy = xp.where(inside_radius[..., None], xy, side_xy)
+    outside_z = xp.where(inside_height, z, cap_z)
+    interior_xy = xp.where(push_radial[..., None], side_xy, xy)
+    interior_z = xp.where(push_radial, z, cap_z)
+
+    both_inside = inside_radius & inside_height
+    closest_xy = xp.where(both_inside[..., None], interior_xy, outside_xy)
+    closest_z = xp.where(both_inside, interior_z, outside_z)
+    closest_local = xp.concatenate([closest_xy, closest_z[..., None]],
+                                   axis=-1)
+
+    signed_dist = xp.where(
+        both_inside, -xp.minimum(radial_slack, axial_slack),
+        xp.where(inside_radius, cap_dist,
+                xp.where(inside_height, side_dist, corner_dist)))
+
+    closest_world = cyl_centers + xp.einsum(
+        '...ij,...j->...i', cyl_rotations, closest_local)
+    return signed_dist, closest_world
+
+
+def closest_point_on_sphere(points, sphere_centers, sphere_radii, backend):
+    """Signed distance from point(s) to a sphere, and the nearest point
+    on the sphere surface. Trivial counterpart to
+    :func:`closest_point_on_box` / :func:`closest_point_on_cylinder`, for
+    a uniform primitive interface (a sphere's surface point is always
+    ``center + radius`` along the direction from the center to the
+    query point, regardless of whether that point is inside or outside).
+    """
+    xp = backend
+    sphere_radii = xp.asarray(sphere_radii)
+    diff = points - sphere_centers
+    dist_to_center = _safe_norm(diff, xp)
+    direction = diff / dist_to_center[..., None]
+    signed_dist = dist_to_center - sphere_radii
+    closest_world = sphere_centers + direction * sphere_radii[..., None]
+    return signed_dist, closest_world
+
+
+_PRIMITIVE_CLOSEST_POINT_FNS = {
+    'box': closest_point_on_box,
+    'cylinder': closest_point_on_cylinder,
+    'sphere': closest_point_on_sphere,
+}
+
+
+def primitive_pair_signed_distance(prim_a, prim_b, backend, n_iters=6):
+    """Signed distance between two (batches of) convex primitives, each a
+    box, cylinder or sphere.
+
+    When either primitive is a sphere, this reduces to the exact,
+    closed-form point-to-primitive distance (a sphere's surface is
+    rotationally symmetric, so no iteration is needed). Otherwise (box
+    vs box, box vs cylinder, cylinder vs cylinder -- shapes with no
+    simple closed-form separation distance at arbitrary relative pose)
+    this alternates a fixed number of nearest-surface-point projections
+    between the two shapes (``center of B -> project onto A -> project
+    onto B -> ...``) and reports the distance between the last two
+    projected points. This is a heuristic, not a certified global
+    optimum: for two convex, *separated* shapes it converges quickly to
+    the true nearest points, but for deeply overlapping shapes it is not
+    guaranteed to find the maximum-penetration axis. Optimisation costs
+    built on this are therefore soft hints only, exactly like the
+    sphere-based cost they replace -- the caller must still verify
+    waypoints against the exact mesh (see ``collision_pairs_min_distance``
+    in ``aero_demo/scripts/solve_palm_ik.py``).
+
+    Parameters
+    ----------
+    prim_a, prim_b : dict
+        ``{'type': 'box'|'cylinder'|'sphere', 'center': (..., 3),
+        'rotation': (..., 3, 3), ...}`` in world frame, with the extra
+        per-type keys :func:`closest_point_on_box` /
+        :func:`closest_point_on_cylinder` / :func:`closest_point_on_sphere`
+        expect (``half_extents`` / ``radius``+``half_height`` / ``radius``
+        respectively; ``rotation`` is unused for ``sphere``). All arrays
+        share a common leading batch shape.
+    backend : module
+    n_iters : int
+        Fixed number of alternating projections (only used when neither
+        primitive is a sphere).
+
+    Returns
+    -------
+    array, (...,)
+        Signed distance: positive when separated, negative when (the
+        alternating projection detects) overlapping.
+    """
+    xp = backend
+
+    def _project(point, prim):
+        fn = _PRIMITIVE_CLOSEST_POINT_FNS[prim['type']]
+        if prim['type'] == 'sphere':
+            return fn(point, prim['center'], prim['radius'], xp)
+        elif prim['type'] == 'box':
+            return fn(point, prim['center'], prim['rotation'],
+                      prim['half_extents'], xp)
+        else:
+            return fn(point, prim['center'], prim['rotation'],
+                      prim['radius'], prim['half_height'], xp)
+
+    if prim_a['type'] == 'sphere':
+        signed_dist, _ = _project(prim_a['center'], prim_b)
+        return signed_dist - prim_a['radius']
+    if prim_b['type'] == 'sphere':
+        signed_dist, _ = _project(prim_b['center'], prim_a)
+        return signed_dist - prim_b['radius']
+
+    point = prim_b['center']
+    for _ in range(n_iters):
+        _, point_a = _project(point, prim_a)
+        dist_b, point = _project(point_a, prim_b)
+
+    # ``dist_b`` (signed distance from the last A-projected point to B)
+    # is negative exactly when that point ended up inside B, i.e. the
+    # projected pair overlaps -- use it as the overlap sign, but report
+    # the actual gap between the two converged surface points as the
+    # magnitude (both are ~equal once the iteration has converged for a
+    # separated pair).
+    gap = _safe_norm(point_a - point, xp)
+    return xp.where(dist_b < 0.0, -gap, gap)
+
+
+def get_primitive_world_pose(bucket, link_positions, link_rotations,
+                             backend):
+    """World center (and, for box/cylinder, world rotation) of a batch of
+    collision primitives anchored to specific kinematic-chain links.
+
+    Counterpart to :func:`build_fk_functions`'s ``get_sphere_positions``
+    for box/cylinder/sphere primitives (see
+    :func:`skrobot.planner.trajectory_optimization.problem.
+    TrajectoryProblem._compute_collision_primitives`, which builds
+    ``bucket`` -- one such dict per primitive type, already composed
+    with the kinematic-chain-link-to-actual-link offset the way
+    ``sphere_centers_local`` is for spheres).
+
+    Parameters
+    ----------
+    bucket : dict
+        ``{'chain_idx': (n,) int, 'local_center': (n, 3)}``, plus
+        ``'local_rotation': (n, 3, 3)`` for box/cylinder buckets (absent
+        for sphere, whose orientation is irrelevant). Any extra keys
+        (``half_extents``/``radius``/``half_height``) are ignored here.
+    link_positions, link_rotations : array
+        Per-kinematic-chain-link world pose, from ``get_link_transforms``
+        (shape ``(n_joints, 3)`` / ``(n_joints, 3, 3)``).
+    backend : module
+
+    Returns
+    -------
+    world_center : array, (n, 3)
+    world_rotation : array, (n, 3, 3) or None
+        None when ``bucket`` has no ``'local_rotation'`` (sphere bucket).
+    """
+    xp = backend
+    chain_idx = bucket['chain_idx']
+    link_pos = link_positions[chain_idx]
+    link_rot = link_rotations[chain_idx]
+    world_center = link_pos + xp.einsum(
+        '...ij,...j->...i', link_rot, bucket['local_center'])
+    if 'local_rotation' in bucket:
+        world_rotation = xp.einsum(
+            '...ij,...jk->...ik', link_rot, bucket['local_rotation'])
+    else:
+        world_rotation = None
+    return world_center, world_rotation
+
+
 def compute_self_collision_distances(sphere_positions, sphere_radii,
                                      pairs_i, pairs_j, backend):
     """Compute signed distances for self-collision pairs.
@@ -482,6 +783,21 @@ def prepare_fk_data(problem, backend):
         fk_data['collision_link_indices'] = xp.array(
             problem.collision_spheres['link_indices'])
 
+    # Add primitive (box/cylinder/sphere) collision data if available
+    # -- only the jaxls backend consumes these; other backends keep
+    # using 'sphere_radii'/'sphere_centers_local' above unchanged.
+    if getattr(problem, 'collision_primitives', None):
+        fk_data['collision_primitives'] = {
+            ptype: {k: xp.array(v) for k, v in bucket.items()}
+            for ptype, bucket in problem.collision_primitives.items()
+        }
+    if getattr(problem, 'self_collision_primitive_pairs', None):
+        fk_data['self_collision_primitive_pairs'] = {
+            combo: {k: xp.array(v) for k, v in pair_rows.items()}
+            for combo, pair_rows in
+            problem.self_collision_primitive_pairs.items()
+        }
+
     return fk_data
 
 
@@ -495,4 +811,9 @@ __all__ = [
     'compute_self_collision_distances',
     'compute_collision_residuals',
     'prepare_fk_data',
+    'closest_point_on_box',
+    'closest_point_on_cylinder',
+    'closest_point_on_sphere',
+    'primitive_pair_signed_distance',
+    'get_primitive_world_pose',
 ]

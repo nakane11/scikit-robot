@@ -112,6 +112,13 @@ class TrajectoryProblem:
         self.collision_spheres = None
         self.world_obstacles = []
         self.self_collision_pairs = []
+        # Exact box/cylinder/sphere geometry, bucketed by type -- see
+        # _compute_collision_primitives / _compute_self_collision_
+        # primitive_pairs. Only the jaxls backend consumes these; other
+        # backends keep using collision_spheres above unchanged.
+        self.collision_primitives = None
+        self.primitive_link_to_bucket = None
+        self.self_collision_primitive_pairs = None
 
         # FK parameters (lazily computed)
         self._fk_params = None
@@ -631,6 +638,7 @@ class TrajectoryProblem:
 
         # Compute collision link offsets
         self._compute_collision_link_offsets()
+        self._compute_collision_primitives()
 
         # Use 'geq' for hard constraint (Augmented Lagrangian)
         # Use 'soft' for soft cost (gradient descent, etc.)
@@ -693,6 +701,7 @@ class TrajectoryProblem:
                     pairs_j.append(sj)
 
         self.self_collision_pairs = (np.array(pairs_i), np.array(pairs_j))
+        self._compute_self_collision_primitive_pairs(link_pairs)
 
         # Use 'geq' for hard constraint (Augmented Lagrangian)
         # Use 'soft' for soft cost (gradient descent, etc.)
@@ -745,6 +754,92 @@ class TrajectoryProblem:
         self.collision_link_to_chain_idx = np.array(self.collision_link_to_chain_idx)
         self.collision_link_offsets_pos = np.array(self.collision_link_offsets_pos)
         self.collision_link_offsets_rot = np.array(self.collision_link_offsets_rot)
+
+    _PRIMITIVE_TYPES = ('box', 'cylinder', 'sphere')
+
+    @staticmethod
+    def _empty_primitive_bucket(ptype):
+        bucket = {'chain_idx': [], 'local_center': []}
+        if ptype != 'sphere':
+            bucket['local_rotation'] = []
+        if ptype == 'box':
+            bucket['half_extents'] = []
+        elif ptype == 'cylinder':
+            bucket['radius'] = []
+            bucket['half_height'] = []
+        elif ptype == 'sphere':
+            bucket['radius'] = []
+        return bucket
+
+    def _compute_collision_primitives(self):
+        """Per-collision-link exact box/cylinder/sphere geometry (falls
+        back to a bounding sphere -- see
+        ``collision.extract_collision_primitives``), bucketed by type
+        for vectorised residual evaluation in the jaxls backend. Must
+        run after ``_compute_collision_link_offsets`` (reuses its
+        chain-link index / kinematic-chain-link-to-actual-link offset).
+        """
+        from skrobot.planner.trajectory_optimization.collision import (
+            extract_collision_primitives)
+
+        raw = extract_collision_primitives(self.collision_link_list)
+        buckets = {t: self._empty_primitive_bucket(t)
+                  for t in self._PRIMITIVE_TYPES}
+        self.primitive_link_to_bucket = []
+
+        for i, prim in enumerate(raw):
+            if prim is None:
+                self.primitive_link_to_bucket.append(None)
+                continue
+            offset_pos = self.collision_link_offsets_pos[i]
+            offset_rot = self.collision_link_offsets_rot[i]
+            local_center = offset_rot @ prim['center'] + offset_pos
+
+            ptype = prim['type']
+            bucket = buckets[ptype]
+            row = len(bucket['chain_idx'])
+            bucket['chain_idx'].append(self.collision_link_to_chain_idx[i])
+            bucket['local_center'].append(local_center)
+            if ptype != 'sphere':
+                bucket['local_rotation'].append(offset_rot @ prim['rotation'])
+            if ptype == 'box':
+                bucket['half_extents'].append(prim['half_extents'])
+            elif ptype == 'cylinder':
+                bucket['radius'].append(prim['radius'])
+                bucket['half_height'].append(prim['half_height'])
+            elif ptype == 'sphere':
+                bucket['radius'].append(prim['radius'])
+            self.primitive_link_to_bucket.append((ptype, row))
+
+        self.collision_primitives = {
+            t: {k: np.array(v) for k, v in b.items()}
+            for t, b in buckets.items() if len(b['chain_idx']) > 0
+        }
+
+    def _compute_self_collision_primitive_pairs(self, link_pairs):
+        """Group self-collision link pairs by (type_a, type_b) primitive
+        combination, as row indices into ``self.collision_primitives``,
+        for vectorised pairwise distance evaluation in the jaxls
+        backend. Skips a pair if either link has no collision geometry
+        at all (``primitive_link_to_bucket`` entry is ``None``).
+        """
+        grouped = {}
+        for link_i, link_j in link_pairs:
+            entry_i = self.primitive_link_to_bucket[link_i]
+            entry_j = self.primitive_link_to_bucket[link_j]
+            if entry_i is None or entry_j is None:
+                continue
+            type_i, row_i = entry_i
+            type_j, row_j = entry_j
+            key = (type_i, type_j)
+            grouped.setdefault(key, {'rows_a': [], 'rows_b': []})
+            grouped[key]['rows_a'].append(row_i)
+            grouped[key]['rows_b'].append(row_j)
+
+        self.self_collision_primitive_pairs = {
+            key: {k: np.array(v) for k, v in rows.items()}
+            for key, rows in grouped.items()
+        }
 
     def add_pose_cost(
         self,
