@@ -722,35 +722,37 @@ class JaxlsSolver(BaseSolver):
                 if has_sphere_obs:
                     sphere_obs = [
                         o for o in obstacles if o['type'] == 'sphere']
-                    sphere_vals = np.array([
-                        list(o['center']) + [o['radius']]
+                    sphere_flat = np.concatenate([
+                        np.array(list(o['center']) + [o['radius']])
                         for o in sphere_obs
                     ])
                     init_pairs.append(
-                        SphereObsParamVar(
-                            jnp.arange(len(sphere_obs))
-                        ).with_value(jnp.array(sphere_vals))
+                        SphereObsParamVar(jnp.array([0])).with_value(
+                            jnp.array(sphere_flat)[None, :]
+                        )
                     )
                 if has_cyl_obs:
                     cylinder_obs = [
                         o for o in obstacles if o['type'] == 'cylinder']
-                    cyl_geom_vals = np.array([
-                        list(o['center']) + [o['radius'], o['half_height']]
+                    cyl_geom_flat = np.concatenate([
+                        np.array(
+                            list(o['center']) + [o['radius'],
+                                                  o['half_height']])
                         for o in cylinder_obs
                     ])
-                    cyl_rot_vals = np.array([
+                    cyl_rot_flat = np.concatenate([
                         np.asarray(o['rotation']).flatten()
                         for o in cylinder_obs
                     ])
                     init_pairs.append(
-                        CylGeomParamVar(
-                            jnp.arange(len(cylinder_obs))
-                        ).with_value(jnp.array(cyl_geom_vals))
+                        CylGeomParamVar(jnp.array([0])).with_value(
+                            jnp.array(cyl_geom_flat)[None, :]
+                        )
                     )
                     init_pairs.append(
-                        CylRotationParamVar(
-                            jnp.arange(len(cylinder_obs))
-                        ).with_value(jnp.array(cyl_rot_vals))
+                        CylRotationParamVar(jnp.array([0])).with_value(
+                            jnp.array(cyl_rot_flat)[None, :]
+                        )
                     )
                 break
 
@@ -1031,11 +1033,16 @@ class JaxlsSolver(BaseSolver):
                 prim['radius'] = bucket['radius']
             return prim
 
-        def _sphere_obstacle_primitive(sphere_geom):
+        def _sphere_obstacle_primitive(sphere_flat):
+            # sphere_flat: (n_sphere * 4,) -- see the ParamVar comment in
+            # solve() for why this is a flattened batch-of-1 value rather
+            # than a (n_sphere, 4) batch.
+            sphere_geom = sphere_flat.reshape(n_sphere, 4)
             return {'type': 'sphere', 'center': sphere_geom[:, :3],
                    'radius': sphere_geom[:, 3]}
 
-        def _cylinder_obstacle_primitive(cyl_geom, cyl_rotation_flat):
+        def _cylinder_obstacle_primitive(cyl_geom_flat, cyl_rotation_flat):
+            cyl_geom = cyl_geom_flat.reshape(n_cyl, 5)
             return {
                 'type': 'cylinder',
                 'center': cyl_geom[:, :3],
@@ -1077,9 +1084,9 @@ class JaxlsSolver(BaseSolver):
 
             return world_collision_cost(
                 TrajectoryVar(jnp.arange(T)),
-                SphereObsParamVar(jnp.arange(n_sphere)),
-                CylGeomParamVar(jnp.arange(n_cyl)),
-                CylRotationParamVar(jnp.arange(n_cyl)),
+                SphereObsParamVar(jnp.array([0])),
+                CylGeomParamVar(jnp.array([0])),
+                CylRotationParamVar(jnp.array([0])),
             )
         elif sphere_obs:
             @jaxls.Cost.factory(name='world_collision')
@@ -1093,7 +1100,7 @@ class JaxlsSolver(BaseSolver):
 
             return world_collision_cost(
                 TrajectoryVar(jnp.arange(T)),
-                SphereObsParamVar(jnp.arange(n_sphere)),
+                SphereObsParamVar(jnp.array([0])),
             )
         else:
             @jaxls.Cost.factory(name='world_collision')
@@ -1109,8 +1116,8 @@ class JaxlsSolver(BaseSolver):
 
             return world_collision_cost(
                 TrajectoryVar(jnp.arange(T)),
-                CylGeomParamVar(jnp.arange(n_cyl)),
-                CylRotationParamVar(jnp.arange(n_cyl)),
+                CylGeomParamVar(jnp.array([0])),
+                CylRotationParamVar(jnp.array([0])),
             )
 
     def _make_self_collision_cost(self, problem, TrajectoryVar, fk_data, spec):
