@@ -267,6 +267,38 @@ def _select_best_attempts(solutions, success_flags, errors, n_targets, attempts_
     return best_solutions, best_success, best_errors
 
 
+# Number of decimal places FK-derived float constants are rounded to
+# before being returned. These constants get closed over and baked as
+# literal values into jit-compiled graphs (see e.g. ``create_batch_ik_
+# solver``'s ``solve_batch``), and JAX's persistent compilation cache
+# fingerprints the pre-optimization HLO -- so a single differing
+# low-order bit (these values are read back from the robot model's
+# *world* coordinates, which carry rounding history from whatever
+# angles the model held before) makes the cache miss and forces a full
+# recompile. See ``_quantize_fk_constants`` in
+# ``skrobot.planner.trajectory_optimization.solvers.jaxls_solver`` for
+# the same fix applied to the trajectory-optimization path, including
+# why plain ``np.round`` is not enough (it keeps the sign of zero).
+_FK_CONSTANT_DECIMALS = 9
+
+
+def _quantize_fk_constants(obj):
+    """Round FK-derived float arrays so they are bit-reproducible.
+
+    Only recurses into dicts and rounds values that are already
+    ``numpy.ndarray``s of float dtype; everything else (ints, strings,
+    lists of dicts such as ``dynamic_limit_tables``, empty lists, ...)
+    is returned unchanged. This avoids coercing non-array fields (e.g.
+    an empty ``dynamic_limit_tables`` list) into arrays, which would
+    change their type and break truthiness checks downstream.
+    """
+    if isinstance(obj, dict):
+        return {k: _quantize_fk_constants(v) for k, v in obj.items()}
+    if not isinstance(obj, np.ndarray) or obj.dtype.kind != 'f':
+        return obj
+    return np.round(obj, _FK_CONSTANT_DECIMALS) + 0.0
+
+
 def extract_fk_parameters(robot_model, link_list, move_target):
     """Extract FK parameters from a robot model for differentiable computation.
 
@@ -479,7 +511,7 @@ def extract_fk_parameters(robot_model, link_list, move_target):
                     'max_angles': table_data['max_angles'],
                 })
 
-    return {
+    return _quantize_fk_constants({
         'n_joints': n_joints,
         'link_translations': np.array(link_translations),
         'link_rotations': np.array(link_rotations),
@@ -496,7 +528,7 @@ def extract_fk_parameters(robot_model, link_list, move_target):
         'mimic_multipliers': mimic_multipliers,
         'mimic_offsets': mimic_offsets,
         'dynamic_limit_tables': dynamic_limit_tables,
-    }
+    })
 
 
 def forward_kinematics(backend, joint_angles, fk_params):
@@ -4196,6 +4228,17 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
                 pairs_j.append(obstacle_idx)
         obstacle_pairs = (np.array(pairs_i, dtype=np.int64),
                          np.array(pairs_j, dtype=np.int64))
+
+    # local_center/static_center are baked as compile-time constants into
+    # the jit-compiled collision cost (see forward_kinematics/loss_fn
+    # below), and are derived from ``link.worldcoords()`` at whatever pose
+    # the robot happens to be in when this is called -- e.g. after solving
+    # IK for a previous chain, which carries ~1e-15 ULP-level run-to-run
+    # noise (same mechanism as ``extract_fk_parameters``'s constants; see
+    # ``_quantize_fk_constants`` for why this breaks JAX's persistent
+    # compilation cache and why plain rounding needs the ``+ 0.0``).
+    local_center = _quantize_fk_constants(local_center)
+    static_center = _quantize_fk_constants(static_center)
 
     return {
         'chain_idx': offsets['chain_idx'][sphere_link_idx],
