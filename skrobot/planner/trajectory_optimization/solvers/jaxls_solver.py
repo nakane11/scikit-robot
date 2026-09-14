@@ -158,6 +158,22 @@ class JaxlsSolver(BaseSolver):
         # not on PyPI, so the usual ``pip install jaxls`` will not work.
         _require_jaxls()
         self.max_iterations = max_iterations
+        # Compiled-problem cache, keyed by the *structure-only* cache key
+        # from ``_make_cache_key`` (see its docstring). This is a dict
+        # (not a single slot) so that alternating between a handful of
+        # distinct problem structures -- e.g. aero_demo's
+        # plan_handshake_motion.py switching ``robot_arm`` between 'l'
+        # and 'r' from one person to the next -- does not evict a
+        # structure that was already compiled; each distinct structure
+        # keeps its own compiled entry for the solver's lifetime. This
+        # mirrors ``RobotModel._batch_ik_collision_solver_cache``
+        # (skrobot/model/robot_model.py), which caches batch IK solvers
+        # the same way for the same reason (arm-side switches).
+        self._cache = {}
+        # ``_cached_problem``/``_cache_key`` continue to reflect the
+        # entry used by the *most recent* ``solve()`` call (kept for
+        # backward compatibility with existing callers/tests that only
+        # ever exercised a single structure per solver instance).
         self._cached_problem = None
         self._cached_traj_var = None
         self._cached_constraint_param_var = None
@@ -285,24 +301,15 @@ class JaxlsSolver(BaseSolver):
         n_base_dof = getattr(problem, 'n_base_dof', 0)
 
         cache_key = self._make_cache_key(problem)
+        cached_entry = self._cache.get(cache_key)
 
-        if self._cache_key == cache_key and self._cached_problem is not None:
-            ls_problem = self._cached_problem
-            TrajectoryVar = self._cached_traj_var
-            ConstraintParamVar = self._cached_constraint_param_var
-            CartesianPosParamVar = self._cached_cartesian_pos_param_var
-            CartesianRotParamVar = self._cached_cartesian_rot_param_var
-            EEWpPosParamVar = self._cached_ee_wp_pos_param_var
-            EEWpRotParamVar = self._cached_ee_wp_rot_param_var
-            SphereObsParamVar = self._cached_sphere_obs_param_var
-            CylGeomParamVar = self._cached_cyl_geom_param_var
-            CylRotationParamVar = self._cached_cyl_rotation_param_var
-            constraint_ids = self._cached_constraint_ids
-            has_cartesian = self._cached_has_cartesian
-            has_cart_rot = self._cached_has_cart_rot
-            has_ee_waypoints = self._cached_has_ee_waypoints
-            has_sphere_obs = self._cached_has_sphere_obs
-            has_cyl_obs = self._cached_has_cyl_obs
+        if cached_entry is not None:
+            (ls_problem, TrajectoryVar, ConstraintParamVar,
+             CartesianPosParamVar, CartesianRotParamVar,
+             EEWpPosParamVar, EEWpRotParamVar,
+             SphereObsParamVar, CylGeomParamVar, CylRotationParamVar,
+             constraint_ids, has_cartesian, has_cart_rot,
+             has_ee_waypoints, has_sphere_obs, has_cyl_obs) = cached_entry
         else:
             # Pre-scan world_collision obstacle counts so the frozen
             # ParamVar classes below can be sized correctly (each one
@@ -649,23 +656,36 @@ class JaxlsSolver(BaseSolver):
                 variables=all_variables,
             ).analyze()
 
-            self._cached_problem = ls_problem
-            self._cached_traj_var = TrajectoryVar
-            self._cached_constraint_param_var = ConstraintParamVar
-            self._cached_cartesian_pos_param_var = CartesianPosParamVar
-            self._cached_cartesian_rot_param_var = CartesianRotParamVar
-            self._cached_ee_wp_pos_param_var = EEWpPosParamVar
-            self._cached_ee_wp_rot_param_var = EEWpRotParamVar
-            self._cached_sphere_obs_param_var = SphereObsParamVar
-            self._cached_cyl_geom_param_var = CylGeomParamVar
-            self._cached_cyl_rotation_param_var = CylRotationParamVar
-            self._cached_constraint_ids = constraint_ids
-            self._cached_has_cartesian = has_cartesian
-            self._cached_has_cart_rot = has_cart_rot
-            self._cached_has_ee_waypoints = has_ee_waypoints
-            self._cached_has_sphere_obs = has_sphere_obs
-            self._cached_has_cyl_obs = has_cyl_obs
-            self._cache_key = cache_key
+            self._cache[cache_key] = (
+                ls_problem, TrajectoryVar, ConstraintParamVar,
+                CartesianPosParamVar, CartesianRotParamVar,
+                EEWpPosParamVar, EEWpRotParamVar,
+                SphereObsParamVar, CylGeomParamVar, CylRotationParamVar,
+                constraint_ids, has_cartesian, has_cart_rot,
+                has_ee_waypoints, has_sphere_obs, has_cyl_obs,
+            )
+
+        # Mirror the (possibly cache-hit) entry onto the flat
+        # backward-compat attributes so existing callers/tests that
+        # inspect ``solver._cached_problem``/``solver._cache_key`` after
+        # a solve() call keep seeing the entry that was actually used.
+        self._cached_problem = ls_problem
+        self._cached_traj_var = TrajectoryVar
+        self._cached_constraint_param_var = ConstraintParamVar
+        self._cached_cartesian_pos_param_var = CartesianPosParamVar
+        self._cached_cartesian_rot_param_var = CartesianRotParamVar
+        self._cached_ee_wp_pos_param_var = EEWpPosParamVar
+        self._cached_ee_wp_rot_param_var = EEWpRotParamVar
+        self._cached_sphere_obs_param_var = SphereObsParamVar
+        self._cached_cyl_geom_param_var = CylGeomParamVar
+        self._cached_cyl_rotation_param_var = CylRotationParamVar
+        self._cached_constraint_ids = constraint_ids
+        self._cached_has_cartesian = has_cartesian
+        self._cached_has_cart_rot = has_cart_rot
+        self._cached_has_ee_waypoints = has_ee_waypoints
+        self._cached_has_sphere_obs = has_sphere_obs
+        self._cached_has_cyl_obs = has_cyl_obs
+        self._cache_key = cache_key
 
         # --- Build init_vals with current dynamic values ---
         traj_vars = TrajectoryVar(jnp.arange(T))

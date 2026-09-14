@@ -786,6 +786,58 @@ class TestJaxlsSolver(unittest.TestCase):
         solver.solve(problem3, initial_traj)
         self.assertNotEqual(solver._cache_key, cache_key_after_first)
 
+    def test_caching_multi_structure_no_eviction(self):
+        """Alternating between 2 distinct structures must not recompile.
+
+        aero_demo's plan_handshake_motion.py reuses a single JaxlsSolver
+        for the process/node lifetime, but the trajectory problem's
+        structure differs depending on which robot arm is used (left vs
+        right), and successive handshake attempts alternate between arms
+        as different people offer different hands. A single-slot cache
+        (the old behavior) would evict the other arm's compiled problem
+        every time the arm switches, so neither arm would ever actually
+        hit the cache in practice. The cache must instead keep one entry
+        per distinct structure for the solver's lifetime, so an A/B/A
+        sequence hits the cache on the second A (see
+        ``JaxlsSolver.__init__`` cache docstring).
+        """
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import JaxlsSolver
+
+        def make_problem(weight):
+            problem = TrajectoryProblem(
+                self.robot, self.link_list, n_waypoints=3)
+            problem.add_smoothness_cost(weight=weight)
+            return problem
+
+        start = np.zeros(self.n_joints)
+        end = np.ones(self.n_joints) * 0.3
+        initial_traj = interpolate_trajectory(start, end, 3)
+
+        solver = JaxlsSolver(max_iterations=20)
+
+        problem_a = make_problem(1.0)
+        problem_b = make_problem(2.0)
+
+        solver.solve(problem_a, initial_traj)
+        key_a = solver._cache_key
+        cached_problem_a = solver._cached_problem
+        self.assertEqual(len(solver._cache), 1)
+
+        solver.solve(problem_b, initial_traj)
+        key_b = solver._cache_key
+        self.assertNotEqual(key_a, key_b)
+        # Both structures must be retained -- not a single evicted slot.
+        self.assertEqual(len(solver._cache), 2)
+        self.assertIn(key_a, solver._cache)
+        self.assertIn(key_b, solver._cache)
+
+        # Re-solving A must hit the still-cached entry (same object,
+        # no rebuild), even though B was solved in between.
+        solver.solve(problem_a, initial_traj)
+        self.assertEqual(solver._cache_key, key_a)
+        self.assertIs(solver._cached_problem, cached_problem_a)
+        self.assertEqual(len(solver._cache), 2)
+
     def test_five_point_velocity_cost(self):
         from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import JaxlsSolver
 
