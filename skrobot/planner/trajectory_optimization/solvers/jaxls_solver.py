@@ -57,6 +57,14 @@ def _quantize_fk_constants(obj, xp):
     robot model in the same nominal pose yields bit-identical constants
     across processes, so the persistent cache actually hits.
 
+    Rounding alone is not enough, because ``np.round`` keeps the sign of
+    zero: a component that is nominally 0 but carries ~1e-17 of noise
+    rounds to ``+0.0`` in one process and ``-0.0`` in another. Those are
+    different bit patterns, so they print as ``0`` and ``-0`` in the HLO
+    and fingerprint differently even though they are numerically equal.
+    Adding 0.0 maps ``-0.0`` to ``+0.0`` (IEEE-754) and leaves every
+    other value untouched.
+
     Parameters
     ----------
     obj : dict or array_like
@@ -69,15 +77,16 @@ def _quantize_fk_constants(obj, xp):
     -------
     dict or array_like
         Same structure with every floating point array rounded to
-        ``_FK_CONSTANT_DECIMALS`` decimals. Non-float entries (integer
-        index arrays, ``n_joints``) are returned unchanged.
+        ``_FK_CONSTANT_DECIMALS`` decimals and with negative zeros
+        normalized. Non-float entries (integer index arrays,
+        ``n_joints``) are returned unchanged.
     """
     if isinstance(obj, dict):
         return {k: _quantize_fk_constants(v, xp) for k, v in obj.items()}
     arr = np.asarray(obj)
     if arr.dtype.kind != 'f':
         return obj
-    return xp.array(np.round(arr, _FK_CONSTANT_DECIMALS))
+    return xp.array(np.round(arr, _FK_CONSTANT_DECIMALS) + 0.0)
 
 
 def _require_jaxls():
