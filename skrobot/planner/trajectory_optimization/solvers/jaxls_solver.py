@@ -28,6 +28,58 @@ _JAXLS_INSTALL_HINT = (
 )
 
 
+# Number of decimal places the FK-derived constants are rounded to before
+# they are baked into the traced jaxls graph (see
+# ``_quantize_fk_constants``). 9 decimals is 1 nm / 1 nrad -- far below
+# anything a robot model means, and far above the ~1e-15 run-to-run noise
+# it is meant to erase.
+_FK_CONSTANT_DECIMALS = 9
+
+
+def _quantize_fk_constants(obj, xp):
+    """Round FK-derived float constants so they are bit-reproducible.
+
+    Every array reachable from ``prepare_fk_data`` ends up as a literal
+    *constant* inside the traced ``jit_solve`` computation (link
+    transforms, collision primitive offsets, ...). JAX's persistent
+    compilation cache fingerprints the pre-optimization HLO, so a single
+    differing low-order bit in any of those constants makes the entry
+    look like a different computation and forces a full recompile
+    (~20-30 s for a whole-body trajectory problem) even though the
+    compiled code is identical.
+
+    Those constants are read back from the robot model's *world*
+    coordinates, which skrobot updates by applying incremental rotations
+    as joint angles are set. They therefore carry the rounding history of
+    whatever angles the model held before -- e.g. the output of a
+    previous jaxls solve, which is only reproducible to within a few
+    ULPs. Rounding here removes that dependency on history: the same
+    robot model in the same nominal pose yields bit-identical constants
+    across processes, so the persistent cache actually hits.
+
+    Parameters
+    ----------
+    obj : dict or array_like
+        FK data (possibly nested dicts, as returned by
+        ``prepare_fk_data``).
+    xp : module
+        Array module used to rebuild the rounded arrays.
+
+    Returns
+    -------
+    dict or array_like
+        Same structure with every floating point array rounded to
+        ``_FK_CONSTANT_DECIMALS`` decimals. Non-float entries (integer
+        index arrays, ``n_joints``) are returned unchanged.
+    """
+    if isinstance(obj, dict):
+        return {k: _quantize_fk_constants(v, xp) for k, v in obj.items()}
+    arr = np.asarray(obj)
+    if arr.dtype.kind != 'f':
+        return obj
+    return xp.array(np.round(arr, _FK_CONSTANT_DECIMALS))
+
+
 def _require_jaxls():
     """Import jaxls or raise ImportError with the correct install hint."""
     try:
@@ -428,7 +480,11 @@ class JaxlsSolver(BaseSolver):
 
             # Prepare FK data
             from skrobot.planner.trajectory_optimization.fk_utils import prepare_fk_data
-            fk_data = prepare_fk_data(problem, jnp)
+            # Rounded so that the constants baked into the traced graph
+            # are bit-reproducible across processes and the persistent
+            # compilation cache can hit (see _quantize_fk_constants).
+            fk_data = _quantize_fk_constants(
+                prepare_fk_data(problem, jnp), jnp)
 
             costs = []
 
