@@ -113,6 +113,22 @@ def point_to_cylinder_distance(point, cyl_center, cyl_rotation,
             )
 
 
+# extract_collision_spheres's result depends only on each link's
+# ``collision_mesh`` (a fixed, link-local mesh -- ``trimesh.bounds.
+# minimum_cylinder`` never looks at the link's current world pose), not on
+# the robot's current configuration or any obstacle. Callers that rebuild a
+# ``TrajectoryProblem`` once per planning request with the same
+# ``link_list`` (e.g. aero_demo's ``plan_handshake_motion.py``, once per
+# person) therefore recompute the same bounding-capsule spheres from
+# scratch every time even though nothing about the geometry changed. Cache
+# by the identity of the links involved (``id()`` -- Link has no custom
+# ``__eq__``/``__hash__``, so this matches the ``link_collision_shape``
+# cache in aero_demo's ``solve_palm_ik.py`` which relies on the same
+# assumption) to avoid the repeated ``trimesh.bounds.minimum_cylinder``
+# calls, which dominate this function's cost.
+_COLLISION_SPHERES_CACHE = {}
+
+
 def extract_collision_spheres(robot_model, link_list, n_spheres_per_link=3):
     """Extract collision spheres for robot links.
 
@@ -135,6 +151,11 @@ def extract_collision_spheres(robot_model, link_list, n_spheres_per_link=3):
         - 'sphere_radii': Sphere radii (n_spheres,)
         - 'link_indices': Link index for each sphere (n_spheres,)
     """
+    cache_key = (tuple(id(link) for link in link_list), n_spheres_per_link)
+    cached = _COLLISION_SPHERES_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         import trimesh
     except ImportError:
@@ -174,11 +195,13 @@ def extract_collision_spheres(robot_model, link_list, n_spheres_per_link=3):
         sphere_radii.append(0.05)  # Default radius
         link_indices.append(link_idx)
 
-    return {
+    result = {
         'sphere_centers_local': np.array(sphere_centers),
         'sphere_radii': np.array(sphere_radii),
         'link_indices': np.array(link_indices),
     }
+    _COLLISION_SPHERES_CACHE[cache_key] = result
+    return result
 
 
 def _bounding_sphere_primitive(link):
