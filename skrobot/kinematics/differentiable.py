@@ -4539,9 +4539,16 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
     (mimic_parent_indices, mimic_multipliers, mimic_offsets,
      non_mimic_indices, _) = _get_mimic_joint_info(fk_params)
 
-    # Get joint limits for non-mimic joints only
+    # Get joint limits for non-mimic joints only. Aliased under
+    # ``_default_...`` names (in addition to the plain names, still used by
+    # the non-``solve()`` helpers below) so that ``solve()`` -- which
+    # shadows ``joint_limits_lower``/``joint_limits_upper`` with its own
+    # like-named parameters, to accept a per-call override -- can still
+    # reach these solver-creation-time defaults when no override is given.
     joint_limits_lower = backend.array(fk_params['joint_limits_lower'][non_mimic_indices])
     joint_limits_upper = backend.array(fk_params['joint_limits_upper'][non_mimic_indices])
+    _default_opt_joint_limits_lower = joint_limits_lower
+    _default_opt_joint_limits_upper = joint_limits_upper
 
     # JIT cache for different iteration counts
     _jit_cache = {}
@@ -4594,7 +4601,17 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         # is threaded through ``_collision_cost`` as a regular function
         # argument instead of being baked in here -- this is what lets a
         # single compiled solver be reused across calls with different
-        # obstacles instead of recompiling (~minutes) every time.
+        # obstacles instead of recompiling (~minutes) every time. The same
+        # reasoning applies to ``joint_limits_lower``/``joint_limits_upper``:
+        # when this solver includes a virtual planar/6dof base chain (see
+        # ``RobotModel._attach_batch_virtual_base_chain``), the base's
+        # movable range legitimately differs per call (e.g. per-person
+        # yaw/y restrictions in aero_demo's ``solve_palm_ik.py``), so
+        # ``solve_single`` takes them as regular arguments instead of
+        # closing over the ``joint_limits_lower``/``joint_limits_upper``
+        # computed above -- otherwise every distinct range would miss
+        # ``_batch_ik_collision_solver_cache`` and force a fresh trace/
+        # compile (see that cache's docstring).
         if collision_setup is not None:
             import jax.numpy as _jnp
 
@@ -4782,13 +4799,19 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             else:
                 return backend.array(True)
 
-        def solve_single(init_opt_angles, target_pos, target_rot, obstacle_values):
+        def solve_single(init_opt_angles, target_pos, target_rot, obstacle_values,
+                         joint_limits_lower, joint_limits_upper):
             """Solve IK for a single target with early stopping.
 
-            ``obstacle_values`` (see ``_pack_obstacle_values``) is shared
-            across the whole batch (not vmapped over), unlike
+            ``obstacle_values``/``joint_limits_lower``/``joint_limits_upper``
+            are shared across the whole batch (not vmapped over), unlike
             ``init_opt_angles``/``target_pos``/``target_rot`` -- see the
-            ``in_axes`` passed to ``backend.vmap`` below.
+            ``in_axes`` passed to ``backend.vmap`` below. Taking the joint
+            limits as parameters here (shadowing the ``create_batch_ik_
+            solver``-scope arrays of the same name) rather than closing
+            over them is what lets ``body_fn``'s clip use a per-call value
+            without forcing a recompile -- see the comment above this
+            function.
             """
 
             def cond_fn(state):
@@ -4837,15 +4860,17 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
             return final_full_angles, success, combined_err
 
-        # Vectorize over batch dimension. ``obstacle_values`` is shared
-        # across the batch (in_axes=None), not one set of obstacles per
-        # attempt/target.
-        batched_solve = backend.vmap(solve_single, in_axes=(0, 0, 0, None))
+        # Vectorize over batch dimension. ``obstacle_values``/
+        # ``joint_limits_lower``/``joint_limits_upper`` are shared across
+        # the batch (in_axes=None), not one set per attempt/target.
+        batched_solve = backend.vmap(
+            solve_single, in_axes=(0, 0, 0, None, None, None))
 
         def solve_batch(init_opt_angles, target_positions, target_rotations,
-                        obstacle_values):
+                        obstacle_values, joint_limits_lower, joint_limits_upper):
             return batched_solve(init_opt_angles, target_positions,
-                                target_rotations, obstacle_values)
+                                target_rotations, obstacle_values,
+                                joint_limits_lower, joint_limits_upper)
 
         # JIT compile if supported
         return backend.compile(solve_batch)
@@ -4869,7 +4894,9 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
               collision_activation_distance=0.05,
               self_collision_weight=None,
               self_collision_activation_distance=0.02,
-              collision_obstacles=None):
+              collision_obstacles=None,
+              joint_limits_lower=None,
+              joint_limits_upper=None):
         """Solve batch IK.
 
         Parameters
@@ -4969,6 +4996,20 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             harmless placeholder far from everything instead of omitting
             it) and only the obstacle positions need to change between
             calls. Default is None (use the solver's original obstacles).
+        joint_limits_lower : array-like or None
+            Fresh lower joint limits (for the non-mimic optimization
+            variables, same length/order as ``solve.opt_joint_limits_lower``)
+            to use for *this* call instead of the limits baked in at solver
+            creation time. Together with ``joint_limits_upper``, this is
+            what lets a solver created with a virtual base chain (``use_
+            base`` in ``batch_inverse_kinematics``) be reused across calls
+            whose base movable range differs (e.g. a per-person yaw/y
+            restriction) without recompiling -- mirrors ``collision_
+            obstacles`` above. Must be given together with
+            ``joint_limits_upper``. Default is None (use the solver's
+            original joint limits).
+        joint_limits_upper : array-like or None
+            See ``joint_limits_lower``.
 
         Returns
         -------
@@ -5002,6 +5043,23 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                 obstacle_geoms_for_call, backend)
         else:
             obstacle_values = default_obstacle_values
+
+        if (joint_limits_lower is None) != (joint_limits_upper is None):
+            raise ValueError(
+                "solve()'s joint_limits_lower and joint_limits_upper must "
+                "be given together (got one without the other).")
+        if joint_limits_lower is None:
+            joint_limits_lower = _default_opt_joint_limits_lower
+            joint_limits_upper = _default_opt_joint_limits_upper
+        else:
+            # Reassigning the parameters here (rather than introducing new
+            # local names) is what lets every use below -- the initial-
+            # guess midpoint, the random-attempt sampling, and the
+            # ``solver_fn`` call -- pick up this call's override for free.
+            joint_limits_lower = backend.array(
+                np.asarray(joint_limits_lower, dtype=np.float64))
+            joint_limits_upper = backend.array(
+                np.asarray(joint_limits_upper, dtype=np.float64))
 
         target_positions = backend.array(np.asarray(target_positions, dtype=np.float64))
         target_rotations = backend.array(np.asarray(target_rotations, dtype=np.float64))
@@ -5098,16 +5156,19 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
 
         solver_fn = _jit_cache[cache_key]
 
-        # Solve all (targets × attempts). ``obstacle_values`` is resolved
-        # above from this call's ``collision_obstacles`` (or the solver's
-        # original obstacles); it is not part of ``cache_key`` since
-        # ``solver_fn`` accepts it as a normal argument rather than baking
-        # it in, so the same compiled ``solver_fn`` is reused regardless of
-        # which obstacle values are passed here (see ``solve``'s
-        # ``collision_obstacles`` parameter).
+        # Solve all (targets × attempts). ``obstacle_values``/
+        # ``joint_limits_lower``/``joint_limits_upper`` are resolved above
+        # from this call's overrides (or the solver's creation-time
+        # defaults); none of them are part of ``cache_key`` since
+        # ``solver_fn`` accepts them as normal arguments rather than baking
+        # them in, so the same compiled ``solver_fn`` is reused regardless
+        # of which obstacle/joint-limit values are passed here (see
+        # ``solve``'s ``collision_obstacles``/``joint_limits_lower``/
+        # ``joint_limits_upper`` parameters).
         all_solutions, all_success, all_errors = solver_fn(
             initial_opt_angles, target_positions_for_solve,
-            target_rotations_for_solve, obstacle_values
+            target_rotations_for_solve, obstacle_values,
+            joint_limits_lower, joint_limits_upper
         )
 
         # If multiple attempts, select best solution for each target
@@ -5177,6 +5238,16 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
     solve.n_joints = n_joints
     solve.joint_limits_lower = fk_params['joint_limits_lower']
     solve.joint_limits_upper = fk_params['joint_limits_upper']
+    # Creation-time defaults for the non-mimic optimization variables, in
+    # the same order ``solve``'s ``joint_limits_lower``/``joint_limits_upper``
+    # overrides must use -- e.g. a virtual base chain's leading opt indices
+    # (see ``RobotModel._attach_batch_virtual_base_chain``) can be
+    # overwritten in a copy of these to build a per-call override without
+    # needing to know every other joint's limits.
+    solve.opt_joint_limits_lower = backend.to_numpy(
+        _default_opt_joint_limits_lower)
+    solve.opt_joint_limits_upper = backend.to_numpy(
+        _default_opt_joint_limits_upper)
     solve.fk_fn = fk_fn
     solve.fk_params = fk_params
     solve.backend = backend

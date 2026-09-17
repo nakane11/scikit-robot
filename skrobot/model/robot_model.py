@@ -4221,18 +4221,22 @@ class RobotModel(CascadedLink):
             # The virtual-chain links closest to the root (if any) are
             # freshly created every call (see
             # ``_attach_batch_virtual_base_chain``); only the links after
-            # them are the caller's own, stable objects. Key on those plus
-            # the resolved (min_angle, max_angle) of each virtual joint
-            # (the actual numbers baked into this call's FK, since
-            # ``base_limits`` itself isn't threaded down to here) instead
-            # of the virtual links' own (ever-changing) identity.
+            # them are the caller's own, stable objects. Key on those
+            # instead of the virtual links' own (ever-changing) identity.
+            # The virtual joints' (min_angle, max_angle) is deliberately
+            # *not* part of this key: ``create_batch_ik_solver``'s
+            # ``solve()`` now accepts ``joint_limits_lower``/
+            # ``joint_limits_upper`` overrides per call (mirroring
+            # ``collision_obstacles`` below), so the same compiled solver
+            # is reused and only clips to this call's actual base range at
+            # runtime -- see the ``joint_limits_lower``/``joint_limits_
+            # upper`` computation below. Keying on the resolved limits used
+            # to force a fresh trace/compile for every distinct base range
+            # (e.g. aero_demo's per-person yaw/y restriction in
+            # ``solve_palm_ik.py``), which is exactly what this avoids.
             n_virtual_dof = (
                 _base_state['n_dof'] if _base_state is not None else 0)
             stable_link_list = single_link_list[n_virtual_dof:]
-            base_joint_limits_sig = (
-                tuple((j.min_angle, j.max_angle)
-                      for j in _base_state['chain_joints'])
-                if _base_state is not None else None)
             obstacle_type_sig = tuple(
                 type(o).__name__ for o in (collision_obstacles or ()))
             collision_cache_key = (
@@ -4240,7 +4244,6 @@ class RobotModel(CascadedLink):
                 id(single_move_target),
                 backend,
                 _base_state['use_base'] if _base_state is not None else None,
-                base_joint_limits_sig,
                 tuple(id(link) for link in collision_link_list),
                 obstacle_type_sig,
                 self_collision,
@@ -4302,6 +4305,31 @@ class RobotModel(CascadedLink):
             # in nothing obstacle-related at reuse time -- see its
             # ``collision_obstacles`` parameter.
             solver_kwargs['collision_obstacles'] = collision_obstacles
+            if _base_state is not None:
+                # Always pass this call's resolved virtual-base joint
+                # limits explicitly, for the same reason as
+                # ``collision_obstacles`` just above: ``solver`` may have
+                # come from ``_batch_ik_collision_solver_cache`` and been
+                # created for an earlier call whose base movable range
+                # (``base_limits``) differed (e.g. a different person's
+                # yaw/y restriction), and the collision cache key no
+                # longer bakes the range in (see the cache key comment
+                # above) precisely so it doesn't force a recompile per
+                # range -- ``solve()`` clips to *this* call's range at
+                # runtime instead via its ``joint_limits_lower``/
+                # ``joint_limits_upper`` parameters. The virtual chain's
+                # joints are always the leading non-mimic opt indices (see
+                # the ``base_weight`` comment below), so only those need
+                # overwriting in an otherwise-default copy.
+                n_dof = _base_state['n_dof']
+                limits_lower = solver.opt_joint_limits_lower.copy()
+                limits_upper = solver.opt_joint_limits_upper.copy()
+                limits_lower[:n_dof] = [
+                    j.min_angle for j in _base_state['chain_joints']]
+                limits_upper[:n_dof] = [
+                    j.max_angle for j in _base_state['chain_joints']]
+                solver_kwargs['joint_limits_lower'] = limits_lower
+                solver_kwargs['joint_limits_upper'] = limits_upper
         else:
             solver_kwargs['damping'] = 0.01
 
