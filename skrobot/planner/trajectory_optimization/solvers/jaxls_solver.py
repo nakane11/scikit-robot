@@ -89,6 +89,25 @@ def _quantize_fk_constants(obj, xp):
     return xp.array(np.round(arr, _FK_CONSTANT_DECIMALS) + 0.0)
 
 
+def _pin_cost_group_order(costs):
+    """Make jaxls lay out the cost groups in ``costs`` order.
+
+    ``LeastSquaresProblem.analyze`` sorts the cost groups by ``str`` of
+    their pytree structure, which starts with the repr of
+    ``compute_residual``. Every ``Cost.factory`` cost holds a lambda with
+    the same ``__qualname__``, so the order comes down to the lambdas'
+    memory addresses and can change from one process to the next. The
+    traced graph (argument order) changes with it, which defeats the
+    persistent compilation cache even though the computation is the same.
+    Prefixing the qualname with the cost's position fixes the order;
+    jaxls's residual deduplication compares bytecode and closures, not
+    names, so it is unaffected.
+    """
+    for i, cost in enumerate(costs):
+        cost.compute_residual.__qualname__ = 'skrobot_cost_{:04d}_{}'.format(
+            i, cost.name)
+
+
 def _require_jaxls():
     """Import jaxls or raise ImportError with the correct install hint."""
     try:
@@ -816,6 +835,7 @@ class JaxlsSolver(BaseSolver):
                     all_variables.append(
                         entry['rot_var_class'](jnp.arange(T)))
 
+            _pin_cost_group_order(costs)
             ls_problem = jaxls.LeastSquaresProblem(
                 costs=costs,
                 variables=all_variables,
