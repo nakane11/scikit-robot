@@ -683,6 +683,14 @@ class TrajectoryProblem:
         link_pairs = create_self_collision_pairs(
             self.collision_link_list, ignore_adjacent=True
         )
+        # Two links anchored to the same frame move rigidly together
+        # during the optimisation (any joint between them is not
+        # optimised), so their distance is a constant: a pair that
+        # starts out overlapping (e.g. a mobile base's body and wheels)
+        # would be a constraint that is always violated and has no
+        # gradient. Skip such pairs.
+        anchor = self.collision_link_to_chain_idx
+        link_pairs = [(i, j) for i, j in link_pairs if anchor[i] != anchor[j]]
 
         # Build sphere pair indices
         collision_link_indices = self.collision_spheres['link_indices']
@@ -718,9 +726,28 @@ class TrajectoryProblem:
             weight=weight,
         ))
 
+    @property
+    def root_frame_index(self):
+        """Row of the collision-link frame array that holds the root link.
+
+        The FK used for collision (see ``fk_utils.append_root_frame``)
+        returns one pose per link in ``self.link_list`` followed by the
+        world pose of ``robot_model.root_link`` (which follows the
+        floating-base DoF when ``n_base_dof > 0``).
+        """
+        return len(self.link_list)
+
     def _compute_collision_link_offsets(self):
-        """Compute offsets from kinematic chain links to collision links."""
+        """Compute offsets from kinematic chain links to collision links.
+
+        Each collision link is anchored to its nearest ancestor in
+        ``self.link_list``. A link whose ancestors never reach the chain
+        (e.g. the body or wheels of a mobile base, which sit below the
+        first chain joint) is anchored to ``robot_model.root_link``
+        instead, at ``self.root_frame_index``.
+        """
         link_to_idx = {link: idx for idx, link in enumerate(self.link_list)}
+        root_coords = self.robot_model.root_link.worldcoords()
         self.collision_link_to_chain_idx = []
         self.collision_link_offsets_pos = []
         self.collision_link_offsets_rot = []
@@ -737,19 +764,19 @@ class TrajectoryProblem:
                     parent = parent.parent_link
 
                 if parent is not None:
-                    self.collision_link_to_chain_idx.append(link_to_idx[parent])
-                    parent_coords = parent.worldcoords()
-                    link_coords = link.worldcoords()
-                    rel_pos = parent_coords.inverse_transform_vector(
-                        link_coords.worldpos()
-                    )
-                    rel_rot = parent_coords.worldrot().T @ link_coords.worldrot()
-                    self.collision_link_offsets_pos.append(rel_pos)
-                    self.collision_link_offsets_rot.append(rel_rot)
+                    anchor_idx = link_to_idx[parent]
+                    anchor_coords = parent.worldcoords()
                 else:
-                    self.collision_link_to_chain_idx.append(0)
-                    self.collision_link_offsets_pos.append(np.zeros(3))
-                    self.collision_link_offsets_rot.append(np.eye(3))
+                    anchor_idx = self.root_frame_index
+                    anchor_coords = root_coords
+                link_coords = link.worldcoords()
+                rel_pos = anchor_coords.inverse_transform_vector(
+                    link_coords.worldpos()
+                )
+                rel_rot = anchor_coords.worldrot().T @ link_coords.worldrot()
+                self.collision_link_to_chain_idx.append(anchor_idx)
+                self.collision_link_offsets_pos.append(rel_pos)
+                self.collision_link_offsets_rot.append(rel_rot)
 
         self.collision_link_to_chain_idx = np.array(self.collision_link_to_chain_idx)
         self.collision_link_offsets_pos = np.array(self.collision_link_offsets_pos)

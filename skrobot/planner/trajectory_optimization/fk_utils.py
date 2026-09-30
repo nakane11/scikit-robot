@@ -50,6 +50,8 @@ def build_fk_functions(fk_data, backend):
     coll_offsets_rot = fk_data.get('collision_link_offsets_rot')
     sphere_centers = fk_data.get('sphere_centers_local')
     sphere_link_indices = fk_data.get('collision_link_indices')
+    root_pos = fk_data.get('root_position')
+    root_rot = fk_data.get('root_rotation')
 
     def get_link_transforms(angles):
         """Compute link transforms for given joint angles.
@@ -151,7 +153,8 @@ def build_fk_functions(fk_data, backend):
         if sphere_centers is None:
             return xp.zeros((0, 3))
 
-        link_positions, link_rotations = get_link_transforms(angles)
+        link_positions, link_rotations = append_root_frame(
+            *get_link_transforms(angles), root_pos, root_rot, xp)
 
         chain_idx = coll_link_idx[sphere_link_indices]
         sphere_link_pos = link_positions[chain_idx]
@@ -167,6 +170,23 @@ def build_fk_functions(fk_data, backend):
         return world
 
     return get_link_transforms, get_sphere_positions, get_ee_position, get_ee_pose
+
+
+def append_root_frame(link_positions, link_rotations, root_pos, root_rot,
+                      backend):
+    """Append the root link's world pose as one extra row after the chain
+    link poses.
+
+    Collision links that are not descendants of any chain link (e.g. a
+    mobile base's body or wheels) are anchored to this row -- see
+    ``TrajectoryProblem.root_frame_index``. Returns the inputs unchanged
+    when ``root_pos`` is None (FK data prepared without collision links).
+    """
+    if root_pos is None:
+        return link_positions, link_rotations
+    xp = backend
+    return (xp.concatenate([link_positions, root_pos[None]], axis=0),
+            xp.concatenate([link_rotations, root_rot[None]], axis=0))
 
 
 def compute_sphere_obstacle_distances(sphere_positions, sphere_radii,
@@ -554,8 +574,9 @@ def get_primitive_world_pose(bucket, link_positions, link_rotations,
         for sphere, whose orientation is irrelevant). Any extra keys
         (``half_extents``/``radius``/``half_height``) are ignored here.
     link_positions, link_rotations : array
-        Per-kinematic-chain-link world pose, from ``get_link_transforms``
-        (shape ``(n_joints, 3)`` / ``(n_joints, 3, 3)``).
+        Per-kinematic-chain-link world pose followed by the root link's
+        world pose (see :func:`append_root_frame`; shape
+        ``(n_joints + 1, 3)`` / ``(n_joints + 1, 3, 3)``).
     backend : module
 
     Returns
@@ -770,6 +791,11 @@ def prepare_fk_data(problem, backend):
 
     # Add collision data if available
     if problem.collision_spheres is not None:
+        # Anchor of the collision links that are fixed to the root link
+        # (see TrajectoryProblem.root_frame_index / append_root_frame).
+        root_coords = problem.robot_model.root_link.worldcoords()
+        fk_data['root_position'] = xp.array(root_coords.worldpos())
+        fk_data['root_rotation'] = xp.array(root_coords.worldrot())
         fk_data['collision_link_to_chain_idx'] = xp.array(
             problem.collision_link_to_chain_idx)
         fk_data['collision_link_offsets_pos'] = xp.array(
@@ -803,6 +829,7 @@ def prepare_fk_data(problem, backend):
 
 __all__ = [
     'build_fk_functions',
+    'append_root_frame',
     'rotation_error_vector',
     'rotation_error_log',
     'pose_error_log',

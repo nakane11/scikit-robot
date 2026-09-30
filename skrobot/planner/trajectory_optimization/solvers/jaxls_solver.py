@@ -128,6 +128,106 @@ def _build_root_relative_chain_ee_fks(problem, jnp_module):
     return callables
 
 
+def _floating_base_pose(base_section, n_base_dof, base_pos_default,
+                        base_rot_default, jnp_module):
+    """Root link world pose from the per-waypoint floating-base DoF.
+
+    Same parameterisation as the CoG / multi-EE / base-pose costs:
+    ``[x, y, yaw]`` (planar) or ``[x, y, z, rx, ry, rz]`` (XYZ Euler),
+    applied on top of the root link pose at problem construction.
+    """
+    jnp = jnp_module
+    if n_base_dof == 6:
+        pos = base_pos_default + base_section[:3]
+        rx, ry, rz = base_section[3], base_section[4], base_section[5]
+    else:
+        pos = base_pos_default + jnp.array(
+            [base_section[0], base_section[1], 0.0])
+        rx, ry, rz = 0.0, 0.0, base_section[2]
+    cx, sx = jnp.cos(rx), jnp.sin(rx)
+    cy, sy = jnp.cos(ry), jnp.sin(ry)
+    cz, sz = jnp.cos(rz), jnp.sin(rz)
+    Rx = jnp.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = jnp.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = jnp.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return pos, base_rot_default @ (Rx @ Ry @ Rz)
+
+
+def _build_collision_frames_fn(problem, fk_data, jnp_module):
+    """World poses of the frames the collision primitives are anchored to.
+
+    Returns ``frames(angles_aug) -> (positions, rotations)`` with one row
+    per link in ``problem.link_list`` (all chains, in order) followed by
+    the root link (row ``problem.root_frame_index``). ``angles_aug`` is
+    the per-waypoint variable ``[joint_angles, base_dof]``; the base DoF
+    move the root link, and every chain hangs off it through its parent
+    transform relative to the root link, so collision geometry follows
+    the floating base. With ``n_base_dof == 0`` the root link stays at
+    its pose at problem construction.
+
+    ``fk_data`` must already be quantized (``_quantize_fk_constants``);
+    the root-relative chain parent transforms derived here are quantized
+    the same way so the traced constants stay bit-reproducible.
+    """
+    from skrobot.planner.trajectory_optimization.fk_utils import build_chain_link_transforms_with_base
+
+    jnp = jnp_module
+    root_pos = fk_data['root_position']
+    root_rot = fk_data['root_rotation']
+    root_pos_np = np.asarray(root_pos, dtype=np.float64)
+    root_rot_np = np.asarray(root_rot, dtype=np.float64)
+
+    if problem.is_multi_chain:
+        chain_data = [
+            _quantize_fk_constants({
+                'link_translations': fkp['link_translations'],
+                'link_rotations': fkp['link_rotations'],
+                'joint_axes': fkp['joint_axes'],
+                'base_position': fkp['base_position'],
+                'base_rotation': fkp['base_rotation'],
+                'n_joints': fkp['n_joints'],
+                'ref_angles': fkp['ref_angles'],
+            }, jnp)
+            for fkp in problem.fk_params_per_chain]
+    else:
+        chain_data = [fk_data]
+
+    chains = []
+    offset = 0
+    for data in chain_data:
+        rel_pos, rel_rot = _chain_parent_relative_to_root(
+            data, root_pos_np, root_rot_np)
+        rel = _quantize_fk_constants({'pos': rel_pos, 'rot': rel_rot}, jnp)
+        n = int(data['n_joints'])
+        chains.append((offset, offset + n,
+                       build_chain_link_transforms_with_base(data, jnp),
+                       rel['pos'], rel['rot']))
+        offset += n
+
+    n_joints = problem.n_joints
+    n_base_dof = getattr(problem, 'n_base_dof', 0)
+
+    def frames(angles_aug):
+        if n_base_dof == 0:
+            base_pos, base_rot = root_pos, root_rot
+        else:
+            base_pos, base_rot = _floating_base_pose(
+                angles_aug[n_joints:], n_base_dof, root_pos, root_rot, jnp)
+        positions = []
+        rotations = []
+        for start, end, chain_fk, rel_pos, rel_rot in chains:
+            pos, rot = chain_fk(angles_aug[start:end],
+                                base_pos + base_rot @ rel_pos,
+                                base_rot @ rel_rot)
+            positions.append(pos)
+            rotations.append(rot)
+        positions.append(base_pos[None])
+        rotations.append(base_rot[None])
+        return jnp.concatenate(positions), jnp.concatenate(rotations)
+
+    return frames
+
+
 class JaxlsSolver(BaseSolver):
     """JAXls-based trajectory optimization solver.
 
@@ -978,11 +1078,14 @@ class JaxlsSolver(BaseSolver):
         robot-side primitive geometry is *not* parametric -- it is fixed
         for a given robot/collision_link_list, so it is baked into the
         cost closure like ``sphere_radii`` was before.
+
+        The primitives follow the floating-base DoF, and links fixed to
+        the root link (not below any chain link) are placed relative to
+        it -- see ``_build_collision_frames_fn``.
         """
         import jax.numpy as jnp
         import jaxls
 
-        from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions
         from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals
         from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
         from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
@@ -1007,7 +1110,7 @@ class JaxlsSolver(BaseSolver):
 
         n_sphere = len(sphere_obs)
         n_cyl = len(cylinder_obs)
-        get_link_transforms, _, _, _ = build_fk_functions(fk_data, jnp)
+        collision_frames = _build_collision_frames_fn(problem, fk_data, jnp)
 
         def _expand(prim, axis):
             # Add a broadcasting axis to every array value (all but
@@ -1072,8 +1175,7 @@ class JaxlsSolver(BaseSolver):
             def world_collision_cost(
                 vals, var, sphere_param, cyl_geom_param, cyl_rot_param,
             ):
-                link_positions, link_rotations = get_link_transforms(
-                    vals[var])
+                link_positions, link_rotations = collision_frames(vals[var])
                 obstacle_prims = [
                     _sphere_obstacle_primitive(vals[sphere_param]),
                     _cylinder_obstacle_primitive(
@@ -1091,8 +1193,7 @@ class JaxlsSolver(BaseSolver):
         elif sphere_obs:
             @jaxls.Cost.factory(name='world_collision')
             def world_collision_cost(vals, var, sphere_param):
-                link_positions, link_rotations = get_link_transforms(
-                    vals[var])
+                link_positions, link_rotations = collision_frames(vals[var])
                 obstacle_prims = [_sphere_obstacle_primitive(
                     vals[sphere_param])]
                 return weight * _all_residuals(
@@ -1107,8 +1208,7 @@ class JaxlsSolver(BaseSolver):
             def world_collision_cost(
                 vals, var, cyl_geom_param, cyl_rot_param,
             ):
-                link_positions, link_rotations = get_link_transforms(
-                    vals[var])
+                link_positions, link_rotations = collision_frames(vals[var])
                 obstacle_prims = [_cylinder_obstacle_primitive(
                     vals[cyl_geom_param], vals[cyl_rot_param])]
                 return weight * _all_residuals(
@@ -1134,12 +1234,12 @@ class JaxlsSolver(BaseSolver):
         :func:`~...fk_utils.primitive_pair_signed_distance` -- row *k*
         of group (type_a, type_b) is the distance for one specific
         self-collision link pair, unlike the cross-product used against
-        world obstacles.
+        world obstacles. Primitives are placed with the same
+        ``_build_collision_frames_fn`` as the world collision cost.
         """
         import jax.numpy as jnp
         import jaxls
 
-        from skrobot.planner.trajectory_optimization.fk_utils import build_fk_functions
         from skrobot.planner.trajectory_optimization.fk_utils import compute_collision_residuals
         from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
         from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
@@ -1162,7 +1262,7 @@ class JaxlsSolver(BaseSolver):
 
             return dummy_cost(TrajectoryVar(jnp.array([0])))
 
-        get_link_transforms, _, _, _ = build_fk_functions(fk_data, jnp)
+        collision_frames = _build_collision_frames_fn(problem, fk_data, jnp)
 
         def _primitive_from_rows(ptype, rows, link_positions, link_rotations):
             sub = {k: v[rows] for k, v in robot_buckets[ptype].items()}
@@ -1182,8 +1282,7 @@ class JaxlsSolver(BaseSolver):
 
         @jaxls.Cost.factory(name='self_collision')
         def self_collision_cost(vals, var):
-            angles = vals[var]
-            link_positions, link_rotations = get_link_transforms(angles)
+            link_positions, link_rotations = collision_frames(vals[var])
 
             parts = []
             for (type_a, type_b), rows in pair_groups.items():

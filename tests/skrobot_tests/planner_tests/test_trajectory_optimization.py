@@ -1279,6 +1279,360 @@ class TestFloatingBaseAndMultiChain(unittest.TestCase):
         self.assertLess(larm_err, 0.02)
 
 
+_MOBILE_ARM_URDF = """<?xml version="1.0"?>
+<robot name="mobile_arm">
+  <link name="base_link">
+    <collision>
+      <origin xyz="0 0 0.075" rpy="0 0 0"/>
+      <geometry><box size="0.5 0.4 0.15"/></geometry>
+    </collision>
+  </link>
+  <link name="wheel_link">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.04"/></geometry>
+    </collision>
+  </link>
+  <link name="mount_link">
+    <collision>
+      <origin xyz="0.02 0 0.05" rpy="0 0 0"/>
+      <geometry><sphere radius="0.06"/></geometry>
+    </collision>
+  </link>
+  <link name="link1">
+    <collision>
+      <origin xyz="0 0 0.15" rpy="0 0 0"/>
+      <geometry><box size="0.06 0.06 0.3"/></geometry>
+    </collision>
+  </link>
+  <link name="link2">
+    <collision>
+      <origin xyz="0.1 0 0" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.03" length="0.2"/></geometry>
+    </collision>
+  </link>
+  <link name="tool_link">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><sphere radius="0.04"/></geometry>
+    </collision>
+  </link>
+  <joint name="wheel_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="wheel_link"/>
+    <origin xyz="0.2 0.15 0.05" rpy="1.5708 0 0"/>
+  </joint>
+  <joint name="mount_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="mount_link"/>
+    <origin xyz="-0.1 0 0.15" rpy="0 0 0.3"/>
+  </joint>
+  <joint name="joint1" type="revolute">
+    <parent link="mount_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="1"/>
+  </joint>
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0.3" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5" upper="1.5" effort="10" velocity="1"/>
+  </joint>
+  <joint name="tool_joint" type="fixed">
+    <parent link="link2"/>
+    <child link="tool_link"/>
+    <origin xyz="0.2 0 0" rpy="0 0 0"/>
+  </joint>
+</robot>
+"""
+
+
+def _make_mobile_arm():
+    """Mobile-base robot whose base body / wheel / arm mount are fixed to
+    the root link, below the first joint of the (2-joint) arm chain.
+
+    Returns (robot, chain link_list, collision link_list). The collision
+    list is ordered so that ``create_self_collision_pairs`` keeps pairs
+    between the root-fixed links (they are not list-adjacent).
+    """
+    from skrobot.model import RobotModel
+
+    robot = RobotModel()
+    robot.load_urdf(_MOBILE_ARM_URDF)
+    links = {link.name: link for link in robot.link_list}
+    chain = [links['link1'], links['link2']]
+    collision_links = [links[name] for name in (
+        'base_link', 'link1', 'wheel_link', 'link2', 'mount_link',
+        'tool_link')]
+    return robot, chain, collision_links
+
+
+def _euler_xyz(rx, ry, rz):
+    from skrobot.coordinates.math import rotation_matrix
+    return (rotation_matrix(rx, [1, 0, 0])
+            @ rotation_matrix(ry, [0, 1, 0])
+            @ rotation_matrix(rz, [0, 0, 1]))
+
+
+def _set_root_pose(robot, root_pos, root_rot):
+    """Move ``robot`` so that its root link ends up at the given pose."""
+    from skrobot.coordinates import Coordinates
+    robot_to_root = robot.worldcoords().inverse_transformation().transform(
+        robot.root_link.worldcoords())
+    target = Coordinates(pos=root_pos, rot=root_rot)
+    robot.newcoords(target.transform(robot_to_root.inverse_transformation()))
+
+
+def _expected_primitive_pose(link):
+    prim = link.collision_primitive
+    wc = link.worldcoords()
+    center = wc.worldpos() + wc.worldrot() @ prim['center']
+    rotation = (wc.worldrot() @ prim['rotation']
+                if 'rotation' in prim else None)
+    return center, rotation
+
+
+class TestRootFixedCollisionLinks(unittest.TestCase):
+    """Collision links fixed to the root link (below the first chain
+    joint, e.g. a mobile base's body and wheels) must be placed relative
+    to the root link, which follows the floating-base DoF."""
+
+    def _problem(self, robot, chain, collision_links, n_base_dof):
+        problem = TrajectoryProblem(
+            robot, chain, n_waypoints=3, n_base_dof=n_base_dof)
+        problem.add_collision_cost(collision_links, [], as_constraint=True)
+        problem.add_self_collision_cost(as_constraint=True)
+        return problem
+
+    def test_root_fixed_links_anchor_to_root_frame(self):
+        robot, chain, collision_links = _make_mobile_arm()
+        problem = self._problem(robot, chain, collision_links, 0)
+        anchors = dict(zip([link.name for link in collision_links],
+                           problem.collision_link_to_chain_idx))
+        self.assertEqual(problem.root_frame_index, len(chain))
+        for name in ('base_link', 'wheel_link', 'mount_link'):
+            self.assertEqual(anchors[name], problem.root_frame_index,
+                             msg=name)
+        self.assertEqual(anchors['link1'], 0)
+        self.assertEqual(anchors['link2'], 1)
+        self.assertEqual(anchors['tool_link'], 1)
+
+    def test_rigidly_attached_self_collision_pairs_are_skipped(self):
+        robot, chain, collision_links = _make_mobile_arm()
+        problem = self._problem(robot, chain, collision_links, 3)
+        names = [link.name for link in collision_links]
+        rows = {}
+        for i, entry in enumerate(problem.primitive_link_to_bucket):
+            rows[entry] = names[i]
+        pairs = set()
+        for (type_a, type_b), group in \
+                problem.self_collision_primitive_pairs.items():
+            for row_a, row_b in zip(group['rows_a'], group['rows_b']):
+                pairs.add(frozenset((rows[(type_a, row_a)],
+                                     rows[(type_b, row_b)])))
+        # Both fixed to the root link: constant distance, skipped.
+        self.assertNotIn(frozenset(('base_link', 'wheel_link')), pairs)
+        self.assertNotIn(frozenset(('wheel_link', 'mount_link')), pairs)
+        # Both fixed to link2.
+        self.assertNotIn(frozenset(('link2', 'tool_link')), pairs)
+        # Root-fixed vs arm: kept.
+        self.assertIn(frozenset(('base_link', 'link2')), pairs)
+        self.assertIn(frozenset(('wheel_link', 'tool_link')), pairs)
+
+    def test_sphere_positions_include_root_fixed_links(self):
+        robot, chain, collision_links = _make_mobile_arm()
+        _set_root_pose(robot, [0.3, -0.2, 0.1], _euler_xyz(0.1, -0.2, 0.7))
+        problem = self._problem(robot, chain, collision_links, 0)
+        fk_data = prepare_fk_data(problem, np)
+        _, get_sphere_positions, _, _ = build_fk_functions(fk_data, np)
+        spheres = problem.collision_spheres
+
+        angles = np.array([0.4, -0.6])
+        for link, angle in zip(chain, angles):
+            link.joint.joint_angle(angle)
+        positions = get_sphere_positions(angles)
+        for k, link_idx in enumerate(spheres['link_indices']):
+            link = collision_links[link_idx]
+            expected = link.worldcoords().transform_vector(
+                spheres['sphere_centers_local'][k])
+            testing.assert_allclose(positions[k], expected, atol=1e-9,
+                                    err_msg=link.name)
+
+    @requires_jaxls
+    def test_primitive_world_pose_matches_robot(self):
+        import jax.numpy as jnp
+
+        from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import _build_collision_frames_fn
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import _quantize_fk_constants
+
+        rng = np.random.RandomState(0)
+        for n_base_dof in (0, 3, 6):
+            robot, chain, collision_links = _make_mobile_arm()
+            # Root link not at the world origin when the problem is built:
+            # the base DoF are relative to this pose.
+            root0_pos = np.array([0.5, 0.2, 0.05])
+            root0_rot = _euler_xyz(0.0, 0.0, 0.4)
+            _set_root_pose(robot, root0_pos, root0_rot)
+            problem = self._problem(robot, chain, collision_links,
+                                    n_base_dof)
+            fk_data = _quantize_fk_constants(
+                prepare_fk_data(problem, jnp), jnp)
+            frames = _build_collision_frames_fn(problem, fk_data, jnp)
+
+            for _ in range(4):
+                angles = rng.uniform(-1.2, 1.2, len(chain))
+                if n_base_dof == 0:
+                    base = np.zeros(0)
+                    root_pos, root_rot = root0_pos, root0_rot
+                elif n_base_dof == 3:
+                    base = rng.uniform([-1, -1, -3], [1, 1, 3])
+                    root_pos = root0_pos + [base[0], base[1], 0.0]
+                    root_rot = root0_rot @ _euler_xyz(0.0, 0.0, base[2])
+                else:
+                    base = rng.uniform(-1, 1, 6)
+                    root_pos = root0_pos + base[:3]
+                    root_rot = root0_rot @ _euler_xyz(*base[3:])
+                _set_root_pose(robot, root_pos, root_rot)
+                for link, angle in zip(chain, angles):
+                    link.joint.joint_angle(angle)
+
+                positions, rotations = frames(
+                    jnp.asarray(np.concatenate([angles, base])))
+                for i, link in enumerate(collision_links):
+                    ptype, row = problem.primitive_link_to_bucket[i]
+                    bucket = {
+                        k: v[row:row + 1] for k, v in
+                        fk_data['collision_primitives'][ptype].items()}
+                    center, rotation = get_primitive_world_pose(
+                        bucket, positions, rotations, jnp)
+                    exp_center, exp_rotation = _expected_primitive_pose(link)
+                    msg = '{} (n_base_dof={})'.format(link.name, n_base_dof)
+                    testing.assert_allclose(
+                        np.asarray(center[0]), exp_center, atol=1e-6,
+                        err_msg=msg)
+                    if exp_rotation is not None:
+                        testing.assert_allclose(
+                            np.asarray(rotation[0]), exp_rotation,
+                            atol=1e-6, err_msg=msg)
+
+    @requires_jaxls
+    def test_aero_base_links_do_not_move_with_ankle(self):
+        import jax.numpy as jnp
+
+        from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import _build_collision_frames_fn
+
+        robot = skrobot.models.Aero(use_hand=False)
+        chain = robot.rarm_whole_body.link_list
+        links = {link.name: link for link in robot.link_list}
+        names = ('wheel_base_link', 'wheels_front_left_mecanum',
+                 'leg_shank_link')
+        collision_links = [links[name] for name in names]
+        problem = TrajectoryProblem(robot, chain, n_waypoints=3,
+                                    n_base_dof=3)
+        problem.add_collision_cost(collision_links, [], as_constraint=True)
+        fk_data = prepare_fk_data(problem, jnp)
+        frames = _build_collision_frames_fn(problem, fk_data, jnp)
+        ankle_idx = [link.joint for link in chain].index(robot.ankle_joint)
+        q0 = np.array([link.joint.joint_angle() for link in chain])
+
+        def centers(ankle_angle, base):
+            q = q0.copy()
+            q[ankle_idx] = ankle_angle
+            positions, rotations = frames(
+                jnp.asarray(np.concatenate([q, base])))
+            out = []
+            for i in range(len(collision_links)):
+                ptype, row = problem.primitive_link_to_bucket[i]
+                bucket = {k: v[row:row + 1] for k, v in
+                          fk_data['collision_primitives'][ptype].items()}
+                center, _ = get_primitive_world_pose(
+                    bucket, positions, rotations, jnp)
+                out.append(np.asarray(center[0]))
+            return out
+
+        base = np.array([0.4, -0.3, 0.8])
+        c, s = np.cos(base[2]), np.sin(base[2])
+        base_rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        lo, hi = robot.ankle_joint.min_angle, robot.ankle_joint.max_angle
+        straight = centers(lo + 0.1 * (hi - lo), base)
+        bent = centers(lo + 0.9 * (hi - lo), base)
+        for k in range(2):  # base-fixed links do not move with the ankle
+            testing.assert_allclose(bent[k], straight[k], atol=1e-9,
+                                    err_msg=names[k])
+        self.assertGreater(np.linalg.norm(bent[2] - straight[2]), 1e-3)
+
+        # ... and sit where the robot model puts them. (Aero's links have
+        # mesh collision geometry, i.e. the bounding-sphere fallback of
+        # extract_collision_primitives centred on the mesh vertices.)
+        robot.ankle_joint.joint_angle(lo + 0.9 * (hi - lo))
+        _set_root_pose(robot, [base[0], base[1], 0.0], base_rot)
+        for k, link in enumerate(collision_links):
+            local_center = np.asarray(
+                link.collision_mesh.vertices).mean(axis=0)
+            expected = link.worldcoords().transform_vector(local_center)
+            testing.assert_allclose(bent[k], expected, atol=1e-6,
+                                    err_msg=link.name)
+
+    @requires_jaxls
+    def test_base_avoids_obstacle_along_path(self):
+        """With the base DoF free, the base body must go around an
+        obstacle on the straight line between start and goal."""
+        import jax.numpy as jnp
+
+        from skrobot.planner.trajectory_optimization.fk_utils import get_primitive_world_pose
+        from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import _build_collision_frames_fn
+        from skrobot.planner.trajectory_optimization.solvers.jaxls_solver import JaxlsSolver
+
+        robot, chain, collision_links = _make_mobile_arm()
+        n_waypoints = 12
+        # Beside the straight path, overlapping the base box's +y side
+        # (box half width 0.2) by 5 cm.
+        obstacle = {'type': 'sphere', 'center': np.array([0.8, 0.25, 0.075]),
+                    'radius': 0.1}
+        problem = TrajectoryProblem(robot, chain, n_waypoints=n_waypoints,
+                                    n_base_dof=3)
+        problem.add_smoothness_cost(weight=1.0)
+        problem.add_joint_limit_constraint()
+        problem.add_collision_cost(
+            [collision_links[0]], [obstacle], activation_distance=0.02,
+            as_constraint=True)
+        problem.set_fixed_endpoints(start=True, end=True)
+
+        start = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+        goal = np.array([0.0, 0.0, 1.6, 0.0, 0.0])
+        initial = interpolate_trajectory(start, goal, n_waypoints)
+        result = JaxlsSolver(max_iterations=200).solve(problem, initial)
+
+        fk_data = prepare_fk_data(problem, jnp)
+        frames = _build_collision_frames_fn(problem, fk_data, jnp)
+        bucket = fk_data['collision_primitives']['box']
+        obstacle_prim = {'type': 'sphere',
+                         'center': jnp.asarray(obstacle['center']),
+                         'radius': obstacle['radius']}
+
+        def min_distance(trajectory):
+            dists = []
+            for q in trajectory:
+                positions, rotations = frames(jnp.asarray(q))
+                center, rotation = get_primitive_world_pose(
+                    bucket, positions, rotations, jnp)
+                prim = {'type': 'box', 'center': center[0],
+                        'rotation': rotation[0],
+                        'half_extents': bucket['half_extents'][0]}
+                dists.append(float(primitive_pair_signed_distance(
+                    prim, obstacle_prim, jnp)))
+            return min(dists)
+
+        self.assertLess(min_distance(initial), -0.04)
+        self.assertGreater(min_distance(result.trajectory), -0.005)
+
+
 @requires_jax
 class TestAugmentedLagrangianSolver(unittest.TestCase):
 
