@@ -3693,6 +3693,7 @@ class RobotModel(CascadedLink):
             n_spheres_per_link=3,
             ignore_adjacent_self_collision=True,
             collision_learning_rate=0.5,
+            collision_geometry='spheres',
             **kwargs):
         """Solve batch inverse kinematics for multiple target poses.
 
@@ -3859,6 +3860,14 @@ class RobotModel(CascadedLink):
         collision_learning_rate : float
             Gradient-descent step size, only used when collision avoidance
             is active. Default is 0.5.
+        collision_geometry : str
+            Robot-side shape of the collision penalty. ``'spheres'``
+            (default) approximates each link with ``n_spheres_per_link``
+            spheres along its bounding capsule (an obstacle ``Cylinder``
+            is treated as a capsule). ``'primitive'`` uses each link's
+            exact ``collision_primitive`` (box/cylinder/sphere; a
+            bounding sphere if it has none), the same geometry as the
+            jaxls trajectory optimizer, against exact obstacle shapes.
         **kwargs : dict
             Additional keyword arguments
 
@@ -3980,6 +3989,7 @@ class RobotModel(CascadedLink):
                 n_spheres_per_link=n_spheres_per_link,
                 ignore_adjacent_self_collision=ignore_adjacent_self_collision,
                 collision_learning_rate=collision_learning_rate,
+                collision_geometry=collision_geometry,
                 **kwargs)
         finally:
             if _base_state is not None:
@@ -4010,6 +4020,7 @@ class RobotModel(CascadedLink):
         ignore_adjacent_self_collision = kwargs.pop(
             'ignore_adjacent_self_collision', True)
         collision_learning_rate = kwargs.pop('collision_learning_rate', 0.5)
+        collision_geometry = kwargs.pop('collision_geometry', 'spheres')
         return_all_attempts = kwargs.pop('return_all_attempts', False)
         wants_collision_avoidance = bool(collision_obstacles) or self_collision
         if (wants_collision_avoidance and not collision_link_list
@@ -4252,6 +4263,7 @@ class RobotModel(CascadedLink):
                  if collision_pairs is not None else None),
                 n_spheres_per_link,
                 ignore_adjacent_self_collision,
+                collision_geometry,
             )
             if not hasattr(self, '_batch_ik_collision_solver_cache'):
                 self._batch_ik_collision_solver_cache = {}
@@ -4265,7 +4277,8 @@ class RobotModel(CascadedLink):
                         self_collision=self_collision,
                         collision_pairs=collision_pairs,
                         n_spheres_per_link=n_spheres_per_link,
-                        ignore_adjacent_self_collision=ignore_adjacent_self_collision)
+                        ignore_adjacent_self_collision=ignore_adjacent_self_collision,
+                        collision_geometry=collision_geometry)
             solver = self._batch_ik_collision_solver_cache[collision_cache_key]
         else:
             solver = create_batch_ik_solver(

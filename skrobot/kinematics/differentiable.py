@@ -4067,16 +4067,463 @@ def _compute_collision_link_offsets(link_list, collision_link_list, fk_params):
     }
 
 
+def _check_analytical_obstacle(obs):
+    if callable(obs) and not hasattr(obs, 'worldpos'):
+        raise TypeError(
+            "batch_inverse_kinematics collision avoidance only supports "
+            "analytical primitive obstacles (skrobot.model.primitives "
+            "Sphere/Box/Cylinder, or skrobot.collision geometry); "
+            "SDF/callable obstacles are not supported.")
+
+
+def _resolve_explicit_collision_pairs(collision_link_list, collision_pairs,
+                                      n_obstacles):
+    """Split ``collision_pairs`` (see :func:`_build_collision_setup`) into
+    ``(self_link_pairs, obstacle_link_pairs)`` index lists: ``(ia, ib)``
+    with ``ia < ib`` into ``collision_link_list``, and ``(ia,
+    obstacle_index)``. Both are ``None`` when ``collision_pairs`` is
+    ``None`` (no explicit restriction)."""
+    if collision_pairs is None:
+        return None, None
+    link_index_by_id = {
+        id(link): i for i, link in enumerate(collision_link_list)}
+    explicit_self_link_pairs = []
+    explicit_obstacle_link_pairs = []
+    for link_a, other in collision_pairs:
+        ia = link_index_by_id.get(id(link_a))
+        if ia is None:
+            raise ValueError(
+                "collision_pairs refers to a link ({!r}) that is not "
+                "in collision_link_list.".format(
+                    getattr(link_a, 'name', link_a)))
+        if isinstance(other, (int, np.integer)):
+            if not (0 <= other < n_obstacles):
+                raise ValueError(
+                    "collision_pairs refers to obstacle index {} but "
+                    "there are only {} obstacles.".format(
+                        other, n_obstacles))
+            explicit_obstacle_link_pairs.append((ia, int(other)))
+            continue
+        ib = link_index_by_id.get(id(other))
+        if ib is None:
+            raise ValueError(
+                "collision_pairs refers to a link ({!r}) that is not "
+                "in collision_link_list, and it is not an integer "
+                "obstacle index either.".format(
+                    getattr(other, 'name', other)))
+        explicit_self_link_pairs.append(
+            (ia, ib) if ia < ib else (ib, ia))
+    return explicit_self_link_pairs, explicit_obstacle_link_pairs
+
+
+# Fixed iteration order of primitive types, so the per-type buckets and
+# the (type, type) pair groups -- and hence the traced program -- are laid
+# out identically on every call (never in dict-insertion or object-address
+# order; see ``_build_primitive_collision_setup``).
+_COLLISION_PRIMITIVE_TYPES = ('box', 'capsule', 'cylinder', 'sphere')
+
+# Packed value layout of each obstacle primitive type (see
+# ``_obstacle_to_primitive``). Every leaf is an array so the pytree
+# shape only depends on the type sequence.
+_OBSTACLE_PRIMITIVE_FIELDS = {
+    'sphere': ('center', 'radius'),
+    'box': ('center', 'rotation', 'half_extents'),
+    'cylinder': ('center', 'rotation', 'radius', 'half_height'),
+    'capsule': ('center', 'rotation', 'radius', 'half_height'),
+}
+
+
+def _rotation_with_z_axis(axis):
+    """A rotation matrix whose third column is the unit vector ``axis``."""
+    z = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(z)
+    z = z / norm if norm > 1e-12 else np.array([0.0, 0.0, 1.0])
+    helper = (np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9
+              else np.array([0.0, 1.0, 0.0]))
+    x = np.cross(helper, z)
+    x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    return np.stack([x, y, z], axis=1)
+
+
+def _obstacle_to_primitive(obs):
+    """World-frame obstacle -> ``(type, values)`` for the
+    ``collision_geometry='primitive'`` cost, where ``values`` is a tuple of
+    float64 arrays in ``_OBSTACLE_PRIMITIVE_FIELDS[type]`` order.
+
+    Unlike :func:`skrobot.collision.robot_collision.
+    primitive_obstacle_to_geometry` (used by the sphere cost), a
+    ``skrobot.model.primitives.Cylinder`` stays an exact flat-capped
+    cylinder instead of being rounded into a capsule.
+    """
+    _check_analytical_obstacle(obs)
+    cls = type(obs).__name__
+    is_model_primitive = hasattr(obs, 'worldpos')
+    if is_model_primitive and cls == 'Sphere':
+        radius = getattr(obs, 'radius', getattr(obs, '_radius', 0.05))
+        return 'sphere', (np.asarray(obs.worldpos(), dtype=np.float64),
+                          np.asarray(radius, dtype=np.float64))
+    if is_model_primitive and cls == 'Box':
+        return 'box', (np.asarray(obs.worldpos(), dtype=np.float64),
+                       np.asarray(obs.worldrot(), dtype=np.float64),
+                       np.asarray(obs.extents, dtype=np.float64) / 2.0)
+    if is_model_primitive and cls == 'Cylinder':
+        return 'cylinder', (
+            np.asarray(obs.worldpos(), dtype=np.float64),
+            np.asarray(obs.worldrot(), dtype=np.float64),
+            np.asarray(obs.radius, dtype=np.float64),
+            np.asarray(obs.height / 2.0, dtype=np.float64))
+    if cls == 'Sphere':
+        return 'sphere', (np.asarray(obs.center, dtype=np.float64),
+                          np.asarray(obs.radius, dtype=np.float64))
+    if cls == 'Box':
+        rotation = obs.rotation if obs.rotation is not None else np.eye(3)
+        return 'box', (np.asarray(obs.center, dtype=np.float64),
+                       np.asarray(rotation, dtype=np.float64),
+                       np.asarray(obs.half_extents, dtype=np.float64))
+    if cls == 'Capsule':
+        p1 = np.asarray(obs.p1, dtype=np.float64)
+        p2 = np.asarray(obs.p2, dtype=np.float64)
+        return 'capsule', (
+            (p1 + p2) / 2.0, _rotation_with_z_axis(p2 - p1),
+            np.asarray(obs.radius, dtype=np.float64),
+            np.asarray(np.linalg.norm(p2 - p1) / 2.0, dtype=np.float64))
+    raise TypeError(
+        "Unsupported collision obstacle for batch IK with "
+        "collision_geometry='primitive': {!r} (supported: "
+        "skrobot.model.primitives Sphere/Box/Cylinder, skrobot.collision "
+        "Sphere/Box/Capsule)".format(cls))
+
+
+def _build_primitive_collision_setup(link_list, fk_params,
+                                     collision_link_list, obstacles,
+                                     self_collision,
+                                     ignore_adjacent_self_collision=True,
+                                     collision_pairs=None):
+    """``collision_geometry='primitive'`` counterpart of
+    :func:`_build_collision_setup`: one exact box/cylinder/sphere per link
+    (``link.collision_primitive``, falling back to a bounding sphere --
+    see :func:`skrobot.planner.trajectory_optimization.collision.
+    extract_collision_primitives`, the same geometry the jaxls trajectory
+    optimiser uses) instead of ``n_spheres_per_link`` spheres along a
+    bounding capsule.
+
+    Same ``collision_pairs``/``self_collision`` semantics, same placement
+    of each shape relative to ``link_list`` (including links that are not
+    below any joint of ``link_list``, which stay fixed at their world pose
+    relative to the chain's base -- ``is_static``), and the same "skip
+    self pairs whose relative pose is constant" rule.
+
+    Returns
+    -------
+    dict or None
+        ``'geometry': 'primitive'``, ``'robot_buckets'`` (per primitive
+        type: ``chain_idx``/``is_static``/``local_center``/
+        ``local_rotation``/``static_center``/``static_rotation`` plus the
+        type's dimensions, all compile-time constants),
+        ``'obstacle_types'``/``'obstacles'`` (see
+        :func:`_obstacle_to_primitive`), ``'obstacle_type_rows'`` (per
+        obstacle type, the indices into ``obstacles`` stacked in that
+        type's batch), ``'obstacle_pair_groups'`` and
+        ``'self_pair_groups'`` (lists of ``(type_a, type_b, rows_a,
+        rows_b)`` -- aligned row indices into the robot bucket of
+        ``type_a`` and the obstacle-type batch / robot bucket of
+        ``type_b``).
+    """
+    if not collision_link_list:
+        return None
+
+    from skrobot.planner.trajectory_optimization.collision import create_self_collision_pairs
+    from skrobot.planner.trajectory_optimization.collision import extract_collision_primitives
+
+    raw = extract_collision_primitives(collision_link_list)
+    offsets = _compute_collision_link_offsets(
+        link_list, collision_link_list, fk_params)
+    base_position = np.asarray(fk_params['base_position'])
+    base_rotation = np.asarray(fk_params['base_rotation'])
+
+    buckets = {}
+    link_entry = []
+    for li, prim in enumerate(raw):
+        if prim is None:
+            link_entry.append(None)
+            continue
+        ptype = prim['type']
+        bucket = buckets.setdefault(ptype, {
+            'chain_idx': [], 'is_static': [], 'local_center': [],
+            'local_rotation': [], 'static_center': [],
+            'static_rotation': [], 'dims': []})
+        offset_pos = offsets['offset_pos'][li]
+        offset_rot = offsets['offset_rot'][li]
+        local_center = offset_pos + offset_rot @ np.asarray(
+            prim['center'], dtype=np.float64)
+        local_rotation = offset_rot @ np.asarray(
+            prim.get('rotation', np.eye(3)), dtype=np.float64)
+        is_static = bool(offsets['is_static'][li])
+        if is_static:
+            static_center = base_position + base_rotation @ local_center
+            static_rotation = base_rotation @ local_rotation
+        else:
+            static_center = np.zeros(3)
+            static_rotation = np.eye(3)
+        if ptype == 'box':
+            dims = (np.asarray(prim['half_extents'], dtype=np.float64),)
+        elif ptype == 'cylinder':
+            dims = (float(prim['radius']), float(prim['half_height']))
+        else:
+            dims = (float(prim['radius']),)
+        link_entry.append((ptype, len(bucket['chain_idx'])))
+        bucket['chain_idx'].append(int(offsets['chain_idx'][li]))
+        bucket['is_static'].append(is_static)
+        bucket['local_center'].append(local_center)
+        bucket['local_rotation'].append(local_rotation)
+        bucket['static_center'].append(static_center)
+        bucket['static_rotation'].append(static_rotation)
+        bucket['dims'].append(dims)
+
+    robot_buckets = {}
+    for ptype in _COLLISION_PRIMITIVE_TYPES:
+        if ptype not in buckets:
+            continue
+        b = buckets[ptype]
+        out = {
+            'chain_idx': np.array(b['chain_idx'], dtype=np.int64),
+            'is_static': np.array(b['is_static'], dtype=bool),
+            'local_center': np.array(b['local_center']),
+            'local_rotation': np.array(b['local_rotation']),
+            'static_center': np.array(b['static_center']),
+            'static_rotation': np.array(b['static_rotation']),
+        }
+        if ptype == 'box':
+            out['half_extents'] = np.array([d[0] for d in b['dims']])
+        elif ptype == 'cylinder':
+            out['radius'] = np.array([d[0] for d in b['dims']])
+            out['half_height'] = np.array([d[1] for d in b['dims']])
+        else:
+            out['radius'] = np.array([d[0] for d in b['dims']])
+        # Same reason as ``_build_collision_setup``'s quantisation: these
+        # come from ``link.worldcoords()`` at whatever pose the robot
+        # happens to be in and are baked into the compiled cost, so
+        # ULP-level noise (and -0.0) would change the persistent
+        # compilation cache key.
+        robot_buckets[ptype] = _quantize_fk_constants(out)
+
+    obstacle_prims = [_obstacle_to_primitive(o) for o in (obstacles or [])]
+    obstacle_types = [t for t, _ in obstacle_prims]
+    obstacle_type_rows = {}
+    obstacle_row = []
+    for i, otype in enumerate(obstacle_types):
+        rows = obstacle_type_rows.setdefault(otype, [])
+        obstacle_row.append(len(rows))
+        rows.append(i)
+
+    explicit_self_link_pairs, explicit_obstacle_link_pairs = \
+        _resolve_explicit_collision_pairs(
+            collision_link_list, collision_pairs, len(obstacle_prims))
+
+    def _grouped(pairs):
+        groups = {}
+        for (type_a, row_a), (type_b, row_b) in pairs:
+            g = groups.setdefault((type_a, type_b), ([], []))
+            g[0].append(row_a)
+            g[1].append(row_b)
+        return [
+            (type_a, type_b, np.array(groups[(type_a, type_b)][0],
+                                      dtype=np.int64),
+             np.array(groups[(type_a, type_b)][1], dtype=np.int64))
+            for type_a in _COLLISION_PRIMITIVE_TYPES
+            for type_b in _COLLISION_PRIMITIVE_TYPES
+            if (type_a, type_b) in groups]
+
+    if explicit_obstacle_link_pairs is not None:
+        link_obstacle_pairs = explicit_obstacle_link_pairs
+    else:
+        link_obstacle_pairs = [
+            (li, oi) for li in range(len(collision_link_list))
+            for oi in range(len(obstacle_prims))]
+    obstacle_pair_groups = _grouped([
+        (link_entry[li], (obstacle_types[oi], obstacle_row[oi]))
+        for li, oi in link_obstacle_pairs if link_entry[li] is not None])
+
+    self_pair_groups = []
+    if self_collision:
+        if explicit_self_link_pairs is not None:
+            link_pairs = explicit_self_link_pairs
+        else:
+            link_pairs = create_self_collision_pairs(
+                collision_link_list,
+                ignore_adjacent=ignore_adjacent_self_collision)
+        is_static_link = offsets['is_static']
+        self_pair_groups = _grouped([
+            (link_entry[li], link_entry[lj]) for li, lj in link_pairs
+            # See ``_build_collision_setup``: a pair of links that are
+            # both fixed relative to the chain's base has a constant
+            # distance, hence zero gradient.
+            if not (is_static_link[li] and is_static_link[lj])
+            and link_entry[li] is not None and link_entry[lj] is not None])
+
+    return {
+        'geometry': 'primitive',
+        'robot_buckets': robot_buckets,
+        # Per collision_link_list entry: (primitive type, row in its
+        # bucket), or None if the link has no collision geometry.
+        'link_entry': link_entry,
+        'obstacles': obstacle_prims,
+        'obstacle_types': obstacle_types,
+        'obstacle_type_rows': {
+            t: np.array(rows, dtype=np.int64)
+            for t, rows in obstacle_type_rows.items()},
+        'obstacle_pair_groups': obstacle_pair_groups,
+        'self_pair_groups': self_pair_groups,
+    }
+
+
+def _collision_obstacle_types_and_values(collision_setup, obstacles,
+                                         backend):
+    """``(types, packed_values)`` of ``obstacles`` in the layout
+    ``collision_setup``'s cost expects (see :func:`_pack_obstacle_values`
+    and :func:`_obstacle_to_primitive`)."""
+    if collision_setup.get('geometry') == 'primitive':
+        prims = [_obstacle_to_primitive(o) for o in obstacles]
+        return ([t for t, _ in prims],
+                [tuple(backend.array(v) for v in values)
+                 for _, values in prims])
+    from skrobot.collision.robot_collision import primitive_obstacle_to_geometry
+    geoms = [primitive_obstacle_to_geometry(o) for o in obstacles]
+    return ([type(g).__name__ for g in geoms],
+            _pack_obstacle_values(geoms, backend))
+
+
+def _make_primitive_collision_cost(collision_setup, backend):
+    """Collision cost for ``collision_geometry='primitive'`` (see
+    :func:`_build_primitive_collision_setup`). Same signature and penalty
+    shape (:func:`skrobot.collision.distance.colldist_from_sdf`) as the
+    sphere cost in ``create_batch_ik_solver``; the signed distance is
+    :func:`skrobot.planner.trajectory_optimization.fk_utils.
+    primitive_pair_signed_distance` between the actual shapes, evaluated
+    per (type, type) group in one batched call."""
+    import jax.numpy as jnp
+
+    from skrobot.collision.distance import colldist_from_sdf
+    from skrobot.planner.trajectory_optimization.fk_utils import primitive_pair_signed_distance
+
+    robot_buckets = {
+        ptype: {k: (jnp.asarray(v) if k not in ('chain_idx', 'is_static')
+                    else v)
+                for k, v in b.items()}
+        for ptype, b in collision_setup['robot_buckets'].items()}
+    obstacle_type_rows = collision_setup['obstacle_type_rows']
+    obstacle_pair_groups = collision_setup['obstacle_pair_groups']
+    self_pair_groups = collision_setup['self_pair_groups']
+
+    def _robot_primitives(positions, rotations):
+        prims = {}
+        for ptype, b in robot_buckets.items():
+            chain_idx = b['chain_idx']
+            link_pos = positions[chain_idx]
+            link_rot = rotations[chain_idx]
+            center = link_pos + jnp.einsum(
+                'nij,nj->ni', link_rot, b['local_center'])
+            rotation = jnp.einsum(
+                'nij,njk->nik', link_rot, b['local_rotation'])
+            if np.any(b['is_static']):
+                is_static = b['is_static']
+                center = jnp.where(
+                    is_static[:, None], b['static_center'], center)
+                rotation = jnp.where(
+                    is_static[:, None, None], b['static_rotation'], rotation)
+            prim = {'type': ptype, 'center': center, 'rotation': rotation}
+            for key in ('half_extents', 'radius', 'half_height'):
+                if key in b:
+                    prim[key] = b[key]
+            prims[ptype] = prim
+        return prims
+
+    def _obstacle_primitives(obstacle_values):
+        prims = {}
+        for otype, indices in obstacle_type_rows.items():
+            fields = _OBSTACLE_PRIMITIVE_FIELDS[otype]
+            prim = {'type': otype}
+            for k, field in enumerate(fields):
+                prim[field] = jnp.stack(
+                    [obstacle_values[int(i)][k] for i in indices])
+            prims[otype] = prim
+        return prims
+
+    def _take(prim, rows):
+        return {k: (v if k == 'type' else v[rows]) for k, v in prim.items()}
+
+    def _pair_distance(prim_a, prim_b):
+        dist = primitive_pair_signed_distance(prim_a, prim_b, jnp)
+        if 'sphere' in (prim_a['type'], prim_b['type']):
+            return dist  # closed form, exact
+        # The alternating projection only approaches the true distance
+        # from above, and for some box/cylinder poses (near-parallel
+        # faces/edges) it is still ~cm too large after its fixed
+        # iterations. Starting it from the other shape's center as well
+        # and keeping the smaller gap cuts the overestimate several-fold
+        # (p99 over Aero's links vs random cylinders: 5.7 mm -> 1.4 mm).
+        return jnp.minimum(
+            dist, primitive_pair_signed_distance(prim_b, prim_a, jnp))
+
+    def _group_distances(groups, prims_a, prims_b):
+        return [
+            _pair_distance(_take(prims_a[type_a], rows_a),
+                           _take(prims_b[type_b], rows_b))
+            for type_a, type_b, rows_a, rows_b in groups]
+
+    def _group_cost(groups, prims_a, prims_b, margin):
+        cost = 0.0
+        for dist in _group_distances(groups, prims_a, prims_b):
+            cost = cost + jnp.sum(colldist_from_sdf(dist, margin, xp=jnp))
+        return cost
+
+    def pair_distances(positions, rotations, obstacle_values):
+        """Signed distances per pair group, aligned with
+        ``collision_setup['obstacle_pair_groups']`` /
+        ``['self_pair_groups']`` (for tests and debugging)."""
+        robot = _robot_primitives(positions, rotations)
+        obstacle_dists = (
+            _group_distances(obstacle_pair_groups, robot,
+                             _obstacle_primitives(obstacle_values))
+            if obstacle_pair_groups else [])
+        self_dists = _group_distances(self_pair_groups, robot, robot)
+        return obstacle_dists, self_dists
+
+    def collision_cost(positions, rotations, obstacle_values,
+                       collision_activation_distance, collision_weight,
+                       self_collision_activation_distance,
+                       self_collision_weight):
+        robot = _robot_primitives(positions, rotations)
+        cost = 0.0
+        if obstacle_pair_groups:
+            cost = cost - _group_cost(
+                obstacle_pair_groups, robot,
+                _obstacle_primitives(obstacle_values),
+                collision_activation_distance) * collision_weight
+        if self_pair_groups:
+            cost = cost - _group_cost(
+                self_pair_groups, robot, robot,
+                self_collision_activation_distance) * self_collision_weight
+        return cost
+
+    collision_cost.pair_distances = pair_distances
+    return collision_cost
+
+
 def _build_collision_setup(link_list, fk_params, collision_link_list,
                            obstacles, n_spheres_per_link, self_collision,
                            ignore_adjacent_self_collision=True,
-                           collision_pairs=None):
+                           collision_pairs=None,
+                           collision_geometry='spheres'):
     """Precompute the constant (non-traced) data needed for a collision cost.
 
     Approximates every link in ``collision_link_list`` with a handful of
     spheres, locates each sphere relative to a link in ``link_list`` (see
     :func:`_compute_collision_link_offsets`), and converts ``obstacles`` to
-    analytical world-frame collision geometry.
+    analytical world-frame collision geometry. With
+    ``collision_geometry='primitive'`` this delegates to
+    :func:`_build_primitive_collision_setup` instead.
 
     Parameters
     ----------
@@ -4104,6 +4551,16 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
         'self_pairs' (tuple of index arrays, or None), and 'obstacle_pairs'
         (tuple of index arrays, or None).
     """
+    if collision_geometry == 'primitive':
+        return _build_primitive_collision_setup(
+            link_list, fk_params, collision_link_list, obstacles,
+            self_collision,
+            ignore_adjacent_self_collision=ignore_adjacent_self_collision,
+            collision_pairs=collision_pairs)
+    if collision_geometry != 'spheres':
+        raise ValueError(
+            "collision_geometry must be 'spheres' or 'primitive', got "
+            "{!r}".format(collision_geometry))
     if not collision_link_list:
         return None
 
@@ -4137,47 +4594,12 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
 
     obstacle_geoms = []
     for obs in (obstacles or []):
-        if callable(obs) and not hasattr(obs, 'worldpos'):
-            raise TypeError(
-                "batch_inverse_kinematics collision avoidance only supports "
-                "analytical primitive obstacles (skrobot.model.primitives "
-                "Sphere/Box/Cylinder, or skrobot.collision geometry); "
-                "SDF/callable obstacles are not supported.")
+        _check_analytical_obstacle(obs)
         obstacle_geoms.append(primitive_obstacle_to_geometry(obs))
 
-    link_index_by_id = {
-        id(link): i for i, link in enumerate(collision_link_list)}
-
-    explicit_self_link_pairs = None
-    explicit_obstacle_link_pairs = None
-    if collision_pairs is not None:
-        n_obstacles = len(obstacle_geoms)
-        explicit_self_link_pairs = []
-        explicit_obstacle_link_pairs = []
-        for link_a, other in collision_pairs:
-            ia = link_index_by_id.get(id(link_a))
-            if ia is None:
-                raise ValueError(
-                    "collision_pairs refers to a link ({!r}) that is not "
-                    "in collision_link_list.".format(
-                        getattr(link_a, 'name', link_a)))
-            if isinstance(other, (int, np.integer)):
-                if not (0 <= other < n_obstacles):
-                    raise ValueError(
-                        "collision_pairs refers to obstacle index {} but "
-                        "there are only {} obstacles.".format(
-                            other, n_obstacles))
-                explicit_obstacle_link_pairs.append((ia, int(other)))
-                continue
-            ib = link_index_by_id.get(id(other))
-            if ib is None:
-                raise ValueError(
-                    "collision_pairs refers to a link ({!r}) that is not "
-                    "in collision_link_list, and it is not an integer "
-                    "obstacle index either.".format(
-                        getattr(other, 'name', other)))
-            explicit_self_link_pairs.append(
-                (ia, ib) if ia < ib else (ib, ia))
+    explicit_self_link_pairs, explicit_obstacle_link_pairs = \
+        _resolve_explicit_collision_pairs(
+            collision_link_list, collision_pairs, len(obstacle_geoms))
 
     self_pairs = None
     if self_collision:
@@ -4241,6 +4663,7 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
     static_center = _quantize_fk_constants(static_center)
 
     return {
+        'geometry': 'spheres',
         'chain_idx': offsets['chain_idx'][sphere_link_idx],
         'local_center': local_center,
         'static_center': static_center,
@@ -4353,7 +4776,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                            collision_link_list=None, collision_obstacles=None,
                            self_collision=False, n_spheres_per_link=3,
                            ignore_adjacent_self_collision=True,
-                           collision_pairs=None):
+                           collision_pairs=None,
+                           collision_geometry='spheres'):
     """Create a high-performance batch IK solver.
 
     This is the recommended way to solve batch IK problems. It:
@@ -4410,6 +4834,17 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         no entries of a given kind, that kind of collision cost is not
         computed at all, even if ``self_collision``/``collision_obstacles``
         would otherwise enable it.
+    collision_geometry : str
+        Robot-side shape used by the collision penalty. ``'spheres'``
+        (default): ``n_spheres_per_link`` spheres along each link's
+        bounding capsule, obstacles' ``Cylinder`` treated as a capsule.
+        ``'primitive'``: each link's exact ``link.collision_primitive``
+        (box/cylinder/sphere, bounding sphere if it has none -- the
+        geometry the jaxls trajectory optimiser uses), against exact
+        obstacle shapes (``Cylinder`` stays flat-capped), with
+        :func:`skrobot.planner.trajectory_optimization.fk_utils.
+        primitive_pair_signed_distance`. ``n_spheres_per_link`` is
+        ignored then.
 
     Returns
     -------
@@ -4508,7 +4943,8 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
             link_list, fk_params, collision_link_list, collision_obstacles,
             n_spheres_per_link, self_collision,
             ignore_adjacent_self_collision=ignore_adjacent_self_collision,
-            collision_pairs=collision_pairs)
+            collision_pairs=collision_pairs,
+            collision_geometry=collision_geometry)
 
     # Use optimized NumPy solver for numpy backend
     if backend_name == 'numpy':
@@ -4521,9 +4957,15 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
     # ``_pack_obstacle_values``). Computed once here (not per
     # ``_create_solver_fn``/cache-key variant) since it only depends on
     # ``collision_setup``, which is fixed for the life of this solver.
-    default_obstacle_values = (
-        _pack_obstacle_values(collision_setup['obstacles'], backend)
-        if collision_setup is not None else ())
+    if collision_setup is None:
+        default_obstacle_values = ()
+    elif collision_setup['geometry'] == 'primitive':
+        default_obstacle_values = [
+            tuple(backend.array(v) for v in values)
+            for _, values in collision_setup['obstacles']]
+    else:
+        default_obstacle_values = _pack_obstacle_values(
+            collision_setup['obstacles'], backend)
 
     # Use Jacobian-based solver for JAX (faster)
     if method == 'jacobian' and backend_name == 'jax':
@@ -4612,7 +5054,21 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         # computed above -- otherwise every distinct range would miss
         # ``_batch_ik_collision_solver_cache`` and force a fresh trace/
         # compile (see that cache's docstring).
-        if collision_setup is not None:
+        if (collision_setup is not None
+                and collision_setup['geometry'] == 'primitive'):
+            # Same constant/argument split as the sphere cost below: the
+            # robot-side primitives are closed over, the obstacle values
+            # stay a traced argument.
+            _primitive_cost = _make_primitive_collision_cost(
+                collision_setup, backend)
+
+            def _collision_cost(positions, rotations, obstacle_values):
+                return _primitive_cost(
+                    positions, rotations, obstacle_values,
+                    collision_activation_distance, collision_weight,
+                    self_collision_activation_distance,
+                    self_collision_weight)
+        elif collision_setup is not None:
             import jax.numpy as _jnp
 
             from skrobot.collision.distance import collision_distance as _collision_distance
@@ -5024,11 +5480,9 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                     "solver was created without collision_link_list / "
                     "collision_obstacles; collision avoidance cannot be "
                     "enabled after creation.")
-            from skrobot.collision.robot_collision import primitive_obstacle_to_geometry
-
-            obstacle_geoms_for_call = [
-                primitive_obstacle_to_geometry(o) for o in collision_obstacles]
-            new_types = [type(g).__name__ for g in obstacle_geoms_for_call]
+            new_types, obstacle_values = \
+                _collision_obstacle_types_and_values(
+                    collision_setup, collision_obstacles, backend)
             if new_types != collision_setup['obstacle_types']:
                 raise ValueError(
                     "solve()'s collision_obstacles must have the same "
@@ -5039,8 +5493,6 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                     "far-away placeholder of the same primitive type "
                     "instead of omitting them if the count varies between "
                     "calls.".format(new_types, collision_setup['obstacle_types']))
-            obstacle_values = _pack_obstacle_values(
-                obstacle_geoms_for_call, backend)
         else:
             obstacle_values = default_obstacle_values
 

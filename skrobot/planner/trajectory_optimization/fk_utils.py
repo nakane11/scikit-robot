@@ -469,10 +469,32 @@ def closest_point_on_sphere(points, sphere_centers, sphere_radii, backend):
     return signed_dist, closest_world
 
 
+def closest_point_on_capsule(points, capsule_centers, capsule_rotations,
+                             capsule_radii, capsule_half_heights, backend):
+    """Signed distance from point(s) to a capsule, and the nearest point
+    on the capsule surface. The capsule's core segment runs along local
+    +Z from ``-half_height`` to ``+half_height`` (same parameterisation as
+    :func:`closest_point_on_cylinder`, so the two share the
+    ``radius``/``half_height`` keys in :func:`primitive_pair_signed_distance`);
+    the surface is every point ``radius`` away from that segment.
+    """
+    xp = backend
+    radius = xp.asarray(capsule_radii)
+    half_height = xp.asarray(capsule_half_heights)
+    axis = capsule_rotations[..., :, 2]
+    diff = points - capsule_centers
+    t = xp.clip(xp.sum(diff * axis, axis=-1), -half_height, half_height)
+    core = capsule_centers + axis * t[..., None]
+    signed_dist, closest_world = closest_point_on_sphere(
+        points, core, radius, xp)
+    return signed_dist, closest_world
+
+
 _PRIMITIVE_CLOSEST_POINT_FNS = {
     'box': closest_point_on_box,
     'cylinder': closest_point_on_cylinder,
     'sphere': closest_point_on_sphere,
+    'capsule': closest_point_on_capsule,
 }
 
 
@@ -505,8 +527,9 @@ def primitive_pair_signed_distance(prim_a, prim_b, backend, n_iters=6):
         per-type keys :func:`closest_point_on_box` /
         :func:`closest_point_on_cylinder` / :func:`closest_point_on_sphere`
         expect (``half_extents`` / ``radius``+``half_height`` / ``radius``
-        respectively; ``rotation`` is unused for ``sphere``). All arrays
-        share a common leading batch shape.
+        respectively; ``rotation`` is unused for ``sphere``). ``'capsule'``
+        (:func:`closest_point_on_capsule`) takes the same keys as
+        ``'cylinder'``. All arrays share a common leading batch shape.
     backend : module
     n_iters : int
         Fixed number of alternating projections (only used when neither
@@ -841,6 +864,7 @@ __all__ = [
     'closest_point_on_box',
     'closest_point_on_cylinder',
     'closest_point_on_sphere',
+    'closest_point_on_capsule',
     'primitive_pair_signed_distance',
     'get_primitive_world_pose',
 ]
