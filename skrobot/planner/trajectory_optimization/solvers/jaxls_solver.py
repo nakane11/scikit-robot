@@ -15,6 +15,7 @@ if platform.system() == 'Darwin':
 
 import numpy as np
 
+from skrobot.kinematics.differentiable import _quantize_fk_constant
 from skrobot.planner.trajectory_optimization.solvers.base import BaseSolver
 from skrobot.planner.trajectory_optimization.solvers.base import SolverResult
 
@@ -26,6 +27,62 @@ _JAXLS_INSTALL_HINT = (
     "Install it from source instead:\n"
     "    pip install \"git+https://github.com/brentyi/jaxls.git\""
 )
+
+
+def _quantize_fk_constants(obj, xp):
+    """Round FK-derived float constants so they are bit-reproducible.
+
+    Every array reachable from ``prepare_fk_data`` ends up as a literal
+    *constant* inside the traced ``jit_solve`` computation (link
+    transforms, collision primitive offsets, ...). JAX's persistent
+    compilation cache fingerprints the pre-optimization HLO, so a single
+    differing low-order bit in any of those constants forces a full
+    recompile (~20-30 s for a whole-body trajectory problem) even though
+    the compiled code is identical. The rounding itself, and why it also
+    has to normalize negative zeros, is described at
+    ``skrobot.kinematics.differentiable._quantize_fk_constant``.
+
+    Parameters
+    ----------
+    obj : dict or array_like
+        FK data (possibly nested dicts, as returned by
+        ``prepare_fk_data``).
+    xp : module
+        Array module used to rebuild the rounded arrays.
+
+    Returns
+    -------
+    dict or array_like
+        Same structure with every floating point array rounded to
+        the FK constant precision and with negative zeros normalized.
+        Non-float entries (integer index arrays, ``n_joints``) are
+        returned unchanged.
+    """
+    if isinstance(obj, dict):
+        return {k: _quantize_fk_constants(v, xp) for k, v in obj.items()}
+    arr = np.asarray(obj)
+    if arr.dtype.kind != 'f':
+        return obj
+    return xp.array(_quantize_fk_constant(arr))
+
+
+def _pin_cost_group_order(costs):
+    """Make jaxls lay out the cost groups in ``costs`` order.
+
+    ``LeastSquaresProblem.analyze`` sorts the cost groups by ``str`` of
+    their pytree structure, which starts with the repr of
+    ``compute_residual``. Every ``Cost.factory`` cost holds a lambda with
+    the same ``__qualname__``, so the order comes down to the lambdas'
+    memory addresses and can change from one process to the next. The
+    traced graph (argument order) changes with it, which defeats the
+    persistent compilation cache even though the computation is the same.
+    Prefixing the qualname with the cost's position fixes the order;
+    jaxls's residual deduplication compares bytecode and closures, not
+    names, so it is unaffected.
+    """
+    for i, cost in enumerate(costs):
+        cost.compute_residual.__qualname__ = 'skrobot_cost_{:04d}_{}'.format(
+            i, cost.name)
 
 
 def _require_jaxls():
@@ -521,7 +578,11 @@ class JaxlsSolver(BaseSolver):
 
             # Prepare FK data
             from skrobot.planner.trajectory_optimization.fk_utils import prepare_fk_data
-            fk_data = prepare_fk_data(problem, jnp)
+            # Rounded so that the constants baked into the traced graph
+            # are bit-reproducible across processes and the persistent
+            # compilation cache can hit (see _quantize_fk_constants).
+            fk_data = _quantize_fk_constants(
+                prepare_fk_data(problem, jnp), jnp)
 
             costs = []
 
@@ -744,6 +805,7 @@ class JaxlsSolver(BaseSolver):
                     all_variables.append(
                         entry['rot_var_class'](jnp.arange(T)))
 
+            _pin_cost_group_order(costs)
             ls_problem = jaxls.LeastSquaresProblem(
                 costs=costs,
                 variables=all_variables,
