@@ -17,6 +17,7 @@ class Link(CascadedCoords):
                  collision_mesh=None,
                  visual_mesh=None,
                  mass=None,
+                 lazy_mesh_factory=None,
                  *args, **kwargs):
         super(Link, self).__init__(*args, **kwargs)
         self.centroid = centroid
@@ -26,24 +27,58 @@ class Link(CascadedCoords):
         if inertia_tensor is None:
             inertia_tensor = np.eye(3)
         self.inertia_tensor = inertia_tensor
-        self._collision_mesh = collision_mesh
+        # When ``lazy_mesh_factory`` (a callable returning one
+        # trimesh.Trimesh used as both collision and visual mesh) is
+        # given, the meshes are not built here but on first access of
+        # _collision_mesh / _visual_mesh / _concatenated_visual_mesh
+        # (see __getattr__).  Callers that never read the meshes, e.g.
+        # pure distance queries, then skip the mesh construction cost.
+        self._lazy_mesh_factory = lazy_mesh_factory
+        if lazy_mesh_factory is None:
+            self._collision_mesh = collision_mesh
         # Exact box/cylinder/sphere params (link-local frame) when this
         # link's collision geometry is a single primitive; set by
         # RobotModel.load_urdf_file, None otherwise (mesh geometry,
         # no collision, or more than one collision element).
         self.collision_primitive = None
-        self.visual_mesh = visual_mesh
-        if visual_mesh is not None:
-            trimesh = _lazy_trimesh()
-            self._concatenated_visual_mesh = trimesh.util.concatenate(
-                self._visual_mesh)
-        else:
-            self._concatenated_visual_mesh = None
+        if lazy_mesh_factory is None:
+            self.visual_mesh = visual_mesh
+            if visual_mesh is not None:
+                trimesh = _lazy_trimesh()
+                self._concatenated_visual_mesh = trimesh.util.concatenate(
+                    self._visual_mesh)
+            else:
+                self._concatenated_visual_mesh = None
         self._visual_mesh_changed = False
         self._sdf = None
 
         # Dynamics properties
         self.mass = mass if mass is not None else 1.0  # kg
+
+    _LAZY_MESH_ATTRIBUTES = ('_collision_mesh', '_visual_mesh',
+                             '_concatenated_visual_mesh')
+
+    def __getattr__(self, name):
+        # Only called when normal lookup fails, i.e. for mesh attributes
+        # that have not been built yet.
+        if name in Link._LAZY_MESH_ATTRIBUTES:
+            factory = self.__dict__.get('_lazy_mesh_factory')
+            if factory is not None:
+                self._build_lazy_meshes(factory)
+                return self.__dict__[name]
+        raise AttributeError("'{}' object has no attribute '{}'".format(
+            type(self).__name__, name))
+
+    def _build_lazy_meshes(self, factory):
+        trimesh = _lazy_trimesh()
+        mesh = factory()
+        self._lazy_mesh_factory = None
+        # Do not overwrite meshes that were set explicitly meanwhile.
+        d = self.__dict__
+        d.setdefault('_collision_mesh', mesh)
+        d.setdefault('_visual_mesh', mesh)
+        d.setdefault('_concatenated_visual_mesh',
+                     trimesh.util.concatenate(d['_visual_mesh']))
 
     @property
     def parent_link(self):
