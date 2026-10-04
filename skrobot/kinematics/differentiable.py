@@ -305,6 +305,38 @@ def _select_best_attempts(solutions, success_flags, errors, n_targets, attempts_
     return best_solutions, best_success, best_errors
 
 
+# Number of decimal places the FK constants are rounded to. 9 decimals is
+# 1 nm / 1 nrad: far below anything a robot model means, and far above the
+# ~1e-15 history-dependent noise the rounding is meant to erase.
+_FK_CONSTANT_DECIMALS = 9
+
+
+def _quantize_fk_constant(values):
+    """Round an FK constant so that it is bit-reproducible.
+
+    The constants of ``extract_fk_parameters`` are read back from the
+    robot model's *world* coordinates, which skrobot updates by applying
+    incremental rotations as joint angles are set. They therefore carry the
+    rounding history of whatever angles the model held before, which
+    differs from one process to the next at the ~1e-15 level.
+
+    The solvers bake these constants into the traced (jitted) graph, and
+    JAX's persistent compilation cache is keyed on that graph. A single
+    differing low-order bit makes a cached entry look like a different
+    computation and forces a full recompile, although the compiled code
+    would be identical. Rounding removes the dependency on history.
+
+    Rounding alone is not enough, because ``np.round`` keeps the sign of
+    zero: a component that is nominally 0 but carries ~1e-17 of noise
+    rounds to ``+0.0`` in one process and ``-0.0`` in another. Those are
+    different bit patterns, so they fingerprint differently although they
+    are numerically equal. Adding 0.0 maps ``-0.0`` to ``+0.0`` (IEEE-754)
+    and leaves every other value untouched.
+    """
+    return np.round(np.asarray(values, dtype=np.float64),
+                    _FK_CONSTANT_DECIMALS) + 0.0
+
+
 def extract_fk_parameters(robot_model, link_list, move_target):
     """Extract FK parameters from a robot model for differentiable computation.
 
@@ -528,19 +560,19 @@ def extract_fk_parameters(robot_model, link_list, move_target):
 
     return {
         'n_joints': n_joints,
-        'link_translations': np.array(link_translations),
-        'link_rotations': np.array(link_rotations),
-        'joint_axes': np.array(joint_axes),
+        'link_translations': _quantize_fk_constant(link_translations),
+        'link_rotations': _quantize_fk_constant(link_rotations),
+        'joint_axes': _quantize_fk_constant(joint_axes),
         'joint_types': joint_types,
         'joint_limits_lower': np.array(joint_limits_lower),
         'joint_limits_upper': np.array(joint_limits_upper),
         'joint_limits_unbounded': np.array(joint_limits_unbounded, dtype=bool),
         'joint_names': joint_names,
         'ref_angles': ref_angles,
-        'base_position': base_position,
-        'base_rotation': base_rotation,
-        'ee_offset_position': ee_offset_position,
-        'ee_offset_rotation': ee_offset_rotation,
+        'base_position': _quantize_fk_constant(base_position),
+        'base_rotation': _quantize_fk_constant(base_rotation),
+        'ee_offset_position': _quantize_fk_constant(ee_offset_position),
+        'ee_offset_rotation': _quantize_fk_constant(ee_offset_rotation),
         'mimic_parent_indices': mimic_parent_indices,
         'mimic_multipliers': mimic_multipliers,
         'mimic_offsets': mimic_offsets,

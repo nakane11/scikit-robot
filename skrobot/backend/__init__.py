@@ -14,6 +14,7 @@ Example
 """
 
 # Differentiable backend system
+from skrobot.backend.jax_cache import enable_persistent_cache
 from skrobot.backend.numpy_backend import NumpyBackend
 from skrobot.backend.registry import BackendRegistry
 from skrobot.backend.registry import get_backend
@@ -50,6 +51,7 @@ __all__ = [
     'set_default_backend',
     'list_backends',
     'use_backend',
+    'enable_persistent_cache',
     'rodrigues_rotation',
     'skew_symmetric',
 ]
