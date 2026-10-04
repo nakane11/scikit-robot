@@ -299,6 +299,22 @@ def _quantize_fk_constant(values):
                     _FK_CONSTANT_DECIMALS) + 0.0
 
 
+def _quantize_fk_constants(obj):
+    """Apply :func:`_quantize_fk_constant` to the float arrays in ``obj``.
+
+    Recurses into dicts and rounds the values that are ``numpy.ndarray``s
+    of float dtype; everything else (ints, strings, lists of dicts such as
+    ``dynamic_limit_tables``, empty lists, ...) is returned unchanged, so a
+    non-array field is not coerced into an array, which would change its
+    type and break truthiness checks downstream.
+    """
+    if isinstance(obj, dict):
+        return {k: _quantize_fk_constants(v) for k, v in obj.items()}
+    if not isinstance(obj, np.ndarray) or obj.dtype.kind != 'f':
+        return obj
+    return _quantize_fk_constant(obj)
+
+
 def extract_fk_parameters(robot_model, link_list, move_target):
     """Extract FK parameters from a robot model for differentiable computation.
 
@@ -4650,6 +4666,17 @@ def _build_collision_setup(link_list, fk_params, collision_link_list,
                 pairs_j.append(obstacle_idx)
         obstacle_pairs = (np.array(pairs_i, dtype=np.int64),
                          np.array(pairs_j, dtype=np.int64))
+
+    # local_center/static_center are baked as compile-time constants into
+    # the jit-compiled collision cost (see forward_kinematics/loss_fn
+    # below), and are derived from ``link.worldcoords()`` at whatever pose
+    # the robot happens to be in when this is called -- e.g. after solving
+    # IK for a previous chain, which carries ~1e-15 ULP-level run-to-run
+    # noise (same mechanism as ``extract_fk_parameters``'s constants; see
+    # ``_quantize_fk_constant`` for why this breaks JAX's persistent
+    # compilation cache and why plain rounding needs the ``+ 0.0``).
+    local_center = _quantize_fk_constants(local_center)
+    static_center = _quantize_fk_constants(static_center)
 
     return {
         'geometry': 'spheres',
