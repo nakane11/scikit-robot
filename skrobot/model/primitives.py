@@ -1,3 +1,4 @@
+import functools
 import uuid
 
 import numpy as np
@@ -210,26 +211,32 @@ class Cone(Link):
                                    visual_mesh=mesh)
 
 
+def _build_cylinder_mesh(radius, height, sections,
+                         vertex_colors, face_colors):
+    return _lazy_trimesh().creation.cylinder(
+        radius=radius,
+        height=height,
+        sections=sections,
+        vertex_colors=vertex_colors,
+        face_colors=face_colors,
+    )
+
+
 class Cylinder(Link, SDFImplemented):
 
     def __init__(self, radius, height,
                  sections=32,
                  vertex_colors=None, face_colors=None,
                  pos=(0, 0, 0), rot=np.eye(3), name=None, with_sdf=False):
-        trimesh = _lazy_trimesh()
         if name is None:
             name = 'cylinder_{}'.format(str(uuid.uuid1()).replace('-', '_'))
 
-        mesh = trimesh.creation.cylinder(
-            radius=radius,
-            height=height,
-            sections=sections,
-            vertex_colors=vertex_colors,
-            face_colors=face_colors,
-        )
-        super(Cylinder, self).__init__(pos=pos, rot=rot, name=name,
-                                       collision_mesh=mesh,
-                                       visual_mesh=mesh)
+        # The mesh is built on first access, not here.
+        super(Cylinder, self).__init__(
+            pos=pos, rot=rot, name=name,
+            lazy_mesh_factory=functools.partial(
+                _build_cylinder_mesh, radius, height, sections,
+                vertex_colors, face_colors))
         self.radius = radius
         self.height = height
         if with_sdf:
