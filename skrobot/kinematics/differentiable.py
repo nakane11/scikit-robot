@@ -299,6 +299,52 @@ def _quantize_fk_constants(obj):
     return np.round(obj, _FK_CONSTANT_DECIMALS) + 0.0
 
 
+def _resync_joint_coords(joints):
+    """Recompute each joint's child-link pose from its ``default_coords``
+    and current angle in one step.
+
+    ``RotationalJoint``/``LinearJoint.joint_angle`` move the child link by
+    the *difference* from the previous angle (without renormalizing), so
+    after many angle updates (e.g. thousands of IK iterations) the link
+    poses drift by ~1e-6..1e-5 from what the current angles imply, and the
+    drift depends on the history of angles. Everything this module bakes
+    from ``link.worldcoords()`` (FK constants, collision shape offsets)
+    would then depend on that history, which makes otherwise identical
+    solves differ between processes. The joint angles are unchanged.
+    """
+    from skrobot.model.joint import LinearJoint
+    from skrobot.model.joint import RotationalJoint
+
+    seen = set()
+    for joint in joints:
+        if joint is None or id(joint) in seen:
+            continue
+        seen.add(id(joint))
+        if type(joint) not in (RotationalJoint, LinearJoint):
+            continue
+        child = joint.child_link
+        default = getattr(joint, 'default_coords', None)
+        if child is None or default is None:
+            continue
+        angle = joint._joint_angle
+        child.newcoords(default.copy_coords())
+        if not angle:
+            continue
+        if isinstance(joint, RotationalJoint):
+            child.rotate(angle, joint.axis)
+        else:
+            child.translate(angle * np.asarray(joint.axis, dtype=np.float64))
+
+
+def _resync_robot_joint_coords(robot_model, link_list):
+    """:func:`_resync_joint_coords` for every joint of ``robot_model`` and
+    of ``link_list`` (which may include a virtual base chain that is not in
+    ``robot_model.joint_list``)."""
+    joints = list(getattr(robot_model, 'joint_list', []) or [])
+    joints += [getattr(link, 'joint', None) for link in link_list]
+    _resync_joint_coords(joints)
+
+
 def extract_fk_parameters(robot_model, link_list, move_target):
     """Extract FK parameters from a robot model for differentiable computation.
 
@@ -338,6 +384,10 @@ def extract_fk_parameters(robot_model, link_list, move_target):
     7
     """
     n_joints = len(link_list)
+
+    # Remove accumulated joint-update drift so the constants extracted
+    # below depend only on the current angles (see _resync_joint_coords).
+    _resync_robot_joint_coords(robot_model, link_list)
 
     # Save original joint angles
     original_angles = [link.joint.joint_angle() for link in link_list]
@@ -4195,6 +4245,62 @@ def _obstacle_to_primitive(obs):
         "Sphere/Box/Capsule)".format(cls))
 
 
+_PRIMITIVE_PLACEMENT_KEYS = ('local_center', 'local_rotation',
+                             'static_center', 'static_rotation')
+
+
+def _primitive_robot_placement(placement_sources, offsets=None):
+    """Per primitive type, ``local_center``/``local_rotation`` (in the frame
+    of the shape's chain link) and ``static_center``/``static_rotation`` (in
+    the world, for shapes not below any joint of ``link_list``) of every
+    robot shape, from the robot's *current* pose.
+
+    ``placement_sources`` is ``_build_primitive_collision_setup``'s
+    ``'placement_sources'``; ``offsets`` (from
+    :func:`_compute_collision_link_offsets`) is recomputed if not given.
+    The row order matches ``robot_buckets``.
+    """
+    if offsets is None:
+        # Same drift removal as extract_fk_parameters, for every joint
+        # between a collision link and the root.
+        joints = []
+        for link in placement_sources['collision_link_list']:
+            while link is not None:
+                joints.append(getattr(link, 'joint', None))
+                link = getattr(link, 'parent_link', None)
+        _resync_joint_coords(joints)
+        offsets = _compute_collision_link_offsets(
+            placement_sources['link_list'],
+            placement_sources['collision_link_list'],
+            placement_sources['fk_params'])
+    fk_params = placement_sources['fk_params']
+    base_position = np.asarray(fk_params['base_position'])
+    base_rotation = np.asarray(fk_params['base_rotation'])
+    placement = {}
+    for ptype, rows in placement_sources['row_sources'].items():
+        values = {key: [] for key in _PRIMITIVE_PLACEMENT_KEYS}
+        for li, prim in rows:
+            offset_pos = offsets['offset_pos'][li]
+            offset_rot = offsets['offset_rot'][li]
+            local_center = offset_pos + offset_rot @ np.asarray(
+                prim['center'], dtype=np.float64)
+            local_rotation = offset_rot @ np.asarray(
+                prim.get('rotation', np.eye(3)), dtype=np.float64)
+            if offsets['is_static'][li]:
+                static_center = base_position + base_rotation @ local_center
+                static_rotation = base_rotation @ local_rotation
+            else:
+                static_center = np.zeros(3)
+                static_rotation = np.eye(3)
+            values['local_center'].append(local_center)
+            values['local_rotation'].append(local_rotation)
+            values['static_center'].append(static_center)
+            values['static_rotation'].append(static_rotation)
+        placement[ptype] = {key: np.array(v, dtype=np.float64)
+                            for key, v in values.items()}
+    return placement
+
+
 def _build_primitive_collision_setup(link_list, fk_params,
                                      collision_link_list, obstacles,
                                      self_collision,
@@ -4239,33 +4345,17 @@ def _build_primitive_collision_setup(link_list, fk_params,
     raw = extract_collision_primitives(collision_link_list)
     offsets = _compute_collision_link_offsets(
         link_list, collision_link_list, fk_params)
-    base_position = np.asarray(fk_params['base_position'])
-    base_rotation = np.asarray(fk_params['base_rotation'])
 
     buckets = {}
     link_entry = []
+    row_sources = {}
     for li, prim in enumerate(raw):
         if prim is None:
             link_entry.append(None)
             continue
         ptype = prim['type']
         bucket = buckets.setdefault(ptype, {
-            'chain_idx': [], 'is_static': [], 'local_center': [],
-            'local_rotation': [], 'static_center': [],
-            'static_rotation': [], 'dims': []})
-        offset_pos = offsets['offset_pos'][li]
-        offset_rot = offsets['offset_rot'][li]
-        local_center = offset_pos + offset_rot @ np.asarray(
-            prim['center'], dtype=np.float64)
-        local_rotation = offset_rot @ np.asarray(
-            prim.get('rotation', np.eye(3)), dtype=np.float64)
-        is_static = bool(offsets['is_static'][li])
-        if is_static:
-            static_center = base_position + base_rotation @ local_center
-            static_rotation = base_rotation @ local_rotation
-        else:
-            static_center = np.zeros(3)
-            static_rotation = np.eye(3)
+            'chain_idx': [], 'is_static': [], 'dims': []})
         if ptype == 'box':
             dims = (np.asarray(prim['half_extents'], dtype=np.float64),)
         elif ptype == 'cylinder':
@@ -4274,12 +4364,25 @@ def _build_primitive_collision_setup(link_list, fk_params,
             dims = (float(prim['radius']),)
         link_entry.append((ptype, len(bucket['chain_idx'])))
         bucket['chain_idx'].append(int(offsets['chain_idx'][li]))
-        bucket['is_static'].append(is_static)
-        bucket['local_center'].append(local_center)
-        bucket['local_rotation'].append(local_rotation)
-        bucket['static_center'].append(static_center)
-        bucket['static_rotation'].append(static_rotation)
+        bucket['is_static'].append(bool(offsets['is_static'][li]))
         bucket['dims'].append(dims)
+        row_sources.setdefault(ptype, []).append((li, prim))
+
+    # Where each shape sits relative to its chain link (or, for links not
+    # below any joint of ``link_list``, in the world). For a link that is
+    # attached to its chain ancestor through joints that are *not* in
+    # ``link_list`` (e.g. the other arm when optimizing one arm), this
+    # depends on those joints' current angles, so it is recomputed at every
+    # ``solve()`` call (see :func:`_primitive_robot_placement`) and passed to
+    # the compiled cost as an argument; the values here are only the
+    # defaults for callers that don't pass one.
+    placement_sources = {
+        'link_list': link_list,
+        'collision_link_list': collision_link_list,
+        'fk_params': fk_params,
+        'row_sources': row_sources,
+    }
+    placement = _primitive_robot_placement(placement_sources, offsets)
 
     robot_buckets = {}
     for ptype in _COLLISION_PRIMITIVE_TYPES:
@@ -4289,11 +4392,8 @@ def _build_primitive_collision_setup(link_list, fk_params,
         out = {
             'chain_idx': np.array(b['chain_idx'], dtype=np.int64),
             'is_static': np.array(b['is_static'], dtype=bool),
-            'local_center': np.array(b['local_center']),
-            'local_rotation': np.array(b['local_rotation']),
-            'static_center': np.array(b['static_center']),
-            'static_rotation': np.array(b['static_rotation']),
         }
+        out.update(placement[ptype])
         if ptype == 'box':
             out['half_extents'] = np.array([d[0] for d in b['dims']])
         elif ptype == 'cylinder':
@@ -4365,6 +4465,7 @@ def _build_primitive_collision_setup(link_list, fk_params,
     return {
         'geometry': 'primitive',
         'robot_buckets': robot_buckets,
+        'placement_sources': placement_sources,
         # Per collision_link_list entry: (primitive type, row in its
         # bucket), or None if the link has no collision geometry.
         'link_entry': link_entry,
@@ -4416,22 +4517,25 @@ def _make_primitive_collision_cost(collision_setup, backend):
     obstacle_pair_groups = collision_setup['obstacle_pair_groups']
     self_pair_groups = collision_setup['self_pair_groups']
 
-    def _robot_primitives(positions, rotations):
+    def _robot_primitives(positions, rotations, placement=None):
+        """``placement`` (per type, see :func:`_primitive_robot_placement`)
+        overrides the creation-time shape placement in ``robot_buckets``."""
         prims = {}
         for ptype, b in robot_buckets.items():
+            p = b if placement is None else placement[ptype]
             chain_idx = b['chain_idx']
             link_pos = positions[chain_idx]
             link_rot = rotations[chain_idx]
             center = link_pos + jnp.einsum(
-                'nij,nj->ni', link_rot, b['local_center'])
+                'nij,nj->ni', link_rot, p['local_center'])
             rotation = jnp.einsum(
-                'nij,njk->nik', link_rot, b['local_rotation'])
+                'nij,njk->nik', link_rot, p['local_rotation'])
             if np.any(b['is_static']):
                 is_static = b['is_static']
                 center = jnp.where(
-                    is_static[:, None], b['static_center'], center)
+                    is_static[:, None], p['static_center'], center)
                 rotation = jnp.where(
-                    is_static[:, None, None], b['static_rotation'], rotation)
+                    is_static[:, None, None], p['static_rotation'], rotation)
             prim = {'type': ptype, 'center': center, 'rotation': rotation}
             for key in ('half_extents', 'radius', 'half_height'):
                 if key in b:
@@ -4478,11 +4582,11 @@ def _make_primitive_collision_cost(collision_setup, backend):
             cost = cost + jnp.sum(colldist_from_sdf(dist, margin, xp=jnp))
         return cost
 
-    def pair_distances(positions, rotations, obstacle_values):
+    def pair_distances(positions, rotations, obstacle_values, placement=None):
         """Signed distances per pair group, aligned with
         ``collision_setup['obstacle_pair_groups']`` /
         ``['self_pair_groups']`` (for tests and debugging)."""
-        robot = _robot_primitives(positions, rotations)
+        robot = _robot_primitives(positions, rotations, placement)
         obstacle_dists = (
             _group_distances(obstacle_pair_groups, robot,
                              _obstacle_primitives(obstacle_values))
@@ -4493,8 +4597,8 @@ def _make_primitive_collision_cost(collision_setup, backend):
     def collision_cost(positions, rotations, obstacle_values,
                        collision_activation_distance, collision_weight,
                        self_collision_activation_distance,
-                       self_collision_weight):
-        robot = _robot_primitives(positions, rotations)
+                       self_collision_weight, placement=None):
+        robot = _robot_primitives(positions, rotations, placement)
         cost = 0.0
         if obstacle_pair_groups:
             cost = cost - _group_cost(
@@ -5056,18 +5160,25 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
         # compile (see that cache's docstring).
         if (collision_setup is not None
                 and collision_setup['geometry'] == 'primitive'):
-            # Same constant/argument split as the sphere cost below: the
-            # robot-side primitives are closed over, the obstacle values
-            # stay a traced argument.
+            # The robot-side shape types/sizes and which chain link each
+            # follows are closed over, but where each shape sits (its
+            # placement) is a traced argument alongside the obstacle
+            # values: ``collision_values`` is ``(obstacle_values,
+            # placement)`` (see ``solve``). A shape attached to its chain
+            # link through joints outside ``link_list`` (e.g. the other
+            # arm) moves with those joints, so baking its creation-time
+            # placement in would compute the penalty for whatever pose the
+            # robot was in when this solver was created.
             _primitive_cost = _make_primitive_collision_cost(
                 collision_setup, backend)
 
-            def _collision_cost(positions, rotations, obstacle_values):
+            def _collision_cost(positions, rotations, collision_values):
+                obstacle_values, placement = collision_values
                 return _primitive_cost(
                     positions, rotations, obstacle_values,
                     collision_activation_distance, collision_weight,
                     self_collision_activation_distance,
-                    self_collision_weight)
+                    self_collision_weight, placement=placement)
         elif collision_setup is not None:
             import jax.numpy as _jnp
 
@@ -5495,6 +5606,16 @@ def create_batch_ik_solver(robot_model, link_list, move_target,
                     "calls.".format(new_types, collision_setup['obstacle_types']))
         else:
             obstacle_values = default_obstacle_values
+        if (collision_setup is not None
+                and collision_setup['geometry'] == 'primitive'):
+            # The robot shapes' placement from the robot's current pose
+            # (see ``_create_solver_fn``'s primitive cost).
+            placement = _primitive_robot_placement(
+                collision_setup['placement_sources'])
+            obstacle_values = (obstacle_values, {
+                ptype: {key: backend.array(value)
+                        for key, value in values.items()}
+                for ptype, values in placement.items()})
 
         if (joint_limits_lower is None) != (joint_limits_upper is None):
             raise ValueError(
